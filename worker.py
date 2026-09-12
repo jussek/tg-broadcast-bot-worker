@@ -6,6 +6,7 @@ from typing import Optional
 
 from aiohttp import web
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetHistoryRequest
 from telethon.tl.types import InputPeerUser
 
@@ -28,29 +29,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Инициализация клиента Telethon ---
-# В новых версиях Telethon string_session передается как второй позиционный аргумент
-client = TelegramClient('worker_session', API_ID, API_HASH)
+# Сессия восстанавливается из строки через StringSession, а не через
+# несуществующий аргумент string_session.
+client = TelegramClient(
+    StringSession(SESSION_STRING),
+    api_id=int(API_ID),
+    api_hash=API_HASH
+)
 
 async def init_telethon():
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            # Если сессия протухла или неверна, пытаемся авторизоваться строкой
-            try:
-                await client.start(bot_token=SESSION_STRING) # На случай если это токен бота (маловероятно по названию)
-            except Exception:
-                await client.start(phone=lambda: None, password=lambda: None) # Заглушка, чтобы вызвать ошибку если строка плохая
-                
-        # Правильный способ загрузки сессии из строки в новом клиенте
-        if SESSION_STRING.startswith("1AJ"):
-             await client.parse_id_string(SESSION_STRING) # Для новых форматов
-        else:
-             client.session.save() # Просто пробуем подключиться, сессия загрузится автоматически если файл есть, 
-                                   # но мы используем строку.
-        
-        # Самый надежный способ для string_session в актуальной Telethon:
-        await client.start(session_string=SESSION_STRING)
-        
+            logger.error("❌ Сессия невалидна или истекла (TELEGRAM_SESSION_STRING).")
+            return False
+
         logger.info("✅ Telethon клиент успешно подключен.")
         return True
     except Exception as e:
