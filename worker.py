@@ -36,9 +36,16 @@ async def verify_secret(x_worker_secret: Optional[str] = Header(None)):
 @app.get("/health")
 async def health_check():
     """Проверка здоровья для Railway"""
-    is_connected = client.is_connected()
-    status = "healthy" if is_connected else "degraded"
-    return {"status": status, "telethon_connected": is_connected}
+    try:
+        is_connected = client.is_connected()
+    except Exception:
+        is_connected = False
+    
+    if not is_connected:
+        # Возвращаем 503, если клиент не подключен, чтобы Railway видел проблему
+        raise HTTPException(status_code=503, detail="Telethon client not connected")
+    
+    return {"status": "healthy", "telethon_connected": True}
 
 @app.post("/process_call", dependencies=[Depends(verify_secret)])
 async def process_call(data: dict):
@@ -50,10 +57,21 @@ async def process_call(data: dict):
 async def run_telethon_client():
     """Запуск клиента Telethon в фоне"""
     logger.info("Запуск клиента Telethon...")
-    await client.start()
-    logger.info("Клиент Telethon успешно запущен.")
-    # Держим соединение живым, пока работает сервер
-    await client.run_until_disconnected()
+    try:
+        await client.start()
+        logger.info("Клиент Telethon успешно запущен.")
+        
+        # Проверяем подключение после старта
+        if not client.is_connected():
+            logger.error("Клиент Telethon не смог подключиться после start()")
+            return
+        
+        # Держим соединение живым, пока работает сервер
+        await client.run_until_disconnected()
+    except Exception as e:
+        logger.error(f"Ошибка при запуске Telethon: {e}", exc_info=True)
+        # Не завершаем процесс полностью, даём шанс на рестарт или диагностику
+        # Но healthcheck будет показывать ошибку
 
 async def run_server():
     """Запуск HTTP сервера"""
