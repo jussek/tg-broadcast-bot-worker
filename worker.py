@@ -3,6 +3,7 @@ import sys
 import asyncio
 import signal
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from aiohttp import web
 
 # Получение переменных окружения
@@ -19,10 +20,9 @@ if not all([API_ID, API_HASH, TELEGRAM_SESSION_STRING, WORKER_SECRET]):
 
 # Инициализация клиента Telethon
 client = TelegramClient(
-    session="worker_session",
+    StringSession(TELEGRAM_SESSION_STRING),
     api_id=int(API_ID),
-    api_hash=API_HASH,
-    string_session=TELEGRAM_SESSION_STRING
+    api_hash=API_HASH
 )
 
 # Хранилище для активных задач
