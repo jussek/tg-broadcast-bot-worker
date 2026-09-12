@@ -1,0 +1,7 @@
+aiogram==3.22.0
+telethon==1.42.0
+upstash-redis
+qstash
+fastapi
+aiohttp
+python-dotenv
