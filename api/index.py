@@ -1,349 +1,395 @@
-"""Supabase database layer for Telegram Broadcast Bot.
+"""FastAPI API entrypoint for Telegram Broadcast Bot.
 
-This module provides persistent storage for users, templates, group sets,
-broadcast tasks, and delivery logs using Supabase PostgreSQL.
-
-Redis is still used for:
-- Real-time state (UI pagination, selected chats during session)
-- Locks for concurrent task processing
-- QStash deduplication
-
-Supabase is used for:
-- User profiles and settings
-- Templates with versioning
-- Group sets (unions of chats)
-- Scheduled broadcast tasks
-- Delivery history and analytics
+This module provides the main API endpoints for the Vercel deployment.
+It handles:
+- Health checks
+- User management
+- Template management
+- Group set management
+- Broadcast task management
+- Worker communication
 """
 import os
-import time
-import uuid
-from typing import Optional, Any
+import logging
+from typing import Optional
+from contextlib import asynccontextmanager
 
-from supabase import create_client, Client
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
+
+from storage.supabase_storage import (
+    get_or_create_user,
+    get_user,
+    update_user,
+    create_template,
+    get_template,
+    get_user_templates,
+    update_template as update_template_db,
+    delete_template,
+    create_group_set,
+    get_group_set,
+    get_user_group_sets,
+    update_group_set as update_group_set_db,
+    delete_group_set,
+    create_broadcast_task,
+    get_broadcast_task,
+    get_user_broadcast_tasks,
+    update_broadcast_task,
+    delete_broadcast_task,
+    log_broadcast,
+    get_user_broadcast_logs,
+    get_user_chats,
+    sync_user_chats,
+)
+from worker_client import send_message as worker_send_message, get_chats as worker_get_chats
 
 
 # =========================================================
-# SUPABASE CLIENT
+# LOGGING CONFIGURATION
 # =========================================================
 
-supabase: Optional[Client] = None
-
-
-def get_supabase_client() -> Client:
-    global supabase
-    if supabase is not None:
-        return supabase
-
-    supabase_url = os.getenv("SUPABASE_URL")
-    anon_key = os.getenv("SUPABASE_ANON_KEY")
-    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    if not supabase_url or not (anon_key or service_key):
-        raise RuntimeError(
-            "SUPABASE_URL and SUPABASE_ANON_KEY (or SUPABASE_SERVICE_ROLE_KEY) are required."
-        )
-    supabase = create_client(supabase_url, service_key or anon_key)
-    return supabase
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# USERS TABLE
+# FASTAPI APPLICATION
 # =========================================================
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown events."""
+    logger.info("Starting Telegram Broadcast Bot API")
+    yield
+    logger.info("Shutting down Telegram Broadcast Bot API")
 
-def get_or_create_user(user_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> dict:
-    """Get existing user or create new one."""
-    db = get_supabase_client()
+
+app = FastAPI(
+    title="Telegram Broadcast Bot API",
+    description="API for managing Telegram broadcast campaigns",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+# =========================================================
+# PYDANTIC MODELS
+# =========================================================
+
+class UserCreate(BaseModel):
+    user_id: int
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+
+
+class TemplateCreate(BaseModel):
+    name: str
+    message: str
+    groups: Optional[list] = None
+
+
+class TemplateUpdate(BaseModel):
+    name: Optional[str] = None
+    message: Optional[str] = None
+    groups: Optional[list] = None
+
+
+class GroupSetCreate(BaseModel):
+    name: str
+    groups: Optional[list] = None
+
+
+class GroupSetUpdate(BaseModel):
+    name: Optional[str] = None
+    groups: Optional[list] = None
+
+
+class BroadcastTaskCreate(BaseModel):
+    message: str
+    groups: list
+    interval_minutes: int
+    repeats: int
+
+
+class MessageSend(BaseModel):
+    chat_ids: list
+    message: str
+
+
+# =========================================================
+# HEALTH ENDPOINTS
+# =========================================================
+
+@app.get("/")
+async def root():
+    """Root endpoint with service information."""
+    return {
+        "ok": True,
+        "service": "telegram-broadcast-api",
+        "version": "1.0.0"
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Vercel and monitoring."""
+    return {
+        "ok": True,
+        "service": "telegram-broadcast-api"
+    }
+
+
+# =========================================================
+# USER ENDPOINTS
+# =========================================================
+
+@app.post("/users")
+async def create_user_endpoint(user_data: UserCreate):
+    """Create or get existing user."""
     try:
-        response = db.table("users").select("*").eq("user_id", user_id).execute()
-        if response.data:
-            return response.data[0]
-    except Exception:
-        pass
-
-    user_data = {
-        "user_id": user_id,
-        "username": username,
-        "first_name": first_name,
-        "created_at": time.time(),
-        "is_active": True,
-    }
-    response = db.table("users").insert(user_data).execute()
-    return response.data[0] if response.data else user_data
-
-
-def update_user(user_id: int, **kwargs) -> Optional[dict]:
-    """Update user fields."""
-    db = get_supabase_client()
-    response = db.table("users").update(kwargs).eq("user_id", user_id).execute()
-    return response.data[0] if response.data else None
-
-
-def get_user(user_id: int) -> Optional[dict]:
-    """Get user by ID."""
-    db = get_supabase_client()
-    response = db.table("users").select("*").eq("user_id", user_id).execute()
-    return response.data[0] if response.data else None
-
-
-# =========================================================
-# TEMPLATES TABLE
-# =========================================================
-
-
-def create_template(user_id: int, name: str, message: str, groups: Optional[list] = None) -> dict:
-    """Create a new template."""
-    db = get_supabase_client()
-    template_id = str(uuid.uuid4())
-    template = {
-        "id": template_id,
-        "user_id": user_id,
-        "name": name.strip(),
-        "message": message,
-        "groups": groups or [],
-        "created_at": time.time(),
-        "updated_at": time.time(),
-    }
-    db.table("templates").insert(template).execute()
-    return template
-
-
-def get_template(template_id: str) -> Optional[dict]:
-    """Get template by ID."""
-    db = get_supabase_client()
-    response = db.table("templates").select("*").eq("id", template_id).execute()
-    return response.data[0] if response.data else None
-
-
-def get_user_templates(user_id: int) -> list[dict]:
-    """Get all templates for a user."""
-    db = get_supabase_client()
-    response = db.table("templates").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
-    return response.data or []
-
-
-def update_template(user_id: int, template_id: str, name: Optional[str] = None, message: Optional[str] = None, groups: Optional[list] = None) -> Optional[dict]:
-    """Update template fields."""
-    db = get_supabase_client()
-    updates = {"updated_at": time.time()}
-    if name is not None:
-        updates["name"] = name.strip()
-    if message is not None:
-        updates["message"] = message
-    if groups is not None:
-        updates["groups"] = groups
-
-    response = db.table("templates").update(updates).eq("id", template_id).eq("user_id", user_id).execute()
-    return response.data[0] if response.data else None
-
-
-def delete_template(user_id: int, template_id: str) -> bool:
-    """Delete template."""
-    db = get_supabase_client()
-    response = db.table("templates").delete().eq("id", template_id).eq("user_id", user_id).execute()
-    return len(response.data or []) > 0
-
-
-# =========================================================
-# GROUP SETS TABLE (объединения чатов)
-# =========================================================
-
-
-def create_group_set(user_id: int, name: str, groups: Optional[list] = None) -> dict:
-    """Create a new group set (union of chats)."""
-    db = get_supabase_client()
-    set_id = str(uuid.uuid4())
-    group_set = {
-        "id": set_id,
-        "user_id": user_id,
-        "name": name.strip(),
-        "groups": [int(x) for x in (groups or [])],
-        "created_at": time.time(),
-        "updated_at": time.time(),
-    }
-    db.table("group_sets").insert(group_set).execute()
-    return group_set
-
-
-def get_group_set(set_id: str) -> Optional[dict]:
-    """Get group set by ID."""
-    db = get_supabase_client()
-    response = db.table("group_sets").select("*").eq("id", set_id).execute()
-    return response.data[0] if response.data else None
-
-
-def get_user_group_sets(user_id: int) -> list[dict]:
-    """Get all group sets for a user."""
-    db = get_supabase_client()
-    response = db.table("group_sets").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
-    return response.data or []
-
-
-def update_group_set(user_id: int, set_id: str, name: Optional[str] = None, groups: Optional[list] = None) -> Optional[dict]:
-    """Update group set fields."""
-    db = get_supabase_client()
-    updates = {"updated_at": time.time()}
-    if name is not None:
-        updates["name"] = name.strip()
-    if groups is not None:
-        updates["groups"] = [int(x) for x in groups]
-
-    response = db.table("group_sets").update(updates).eq("id", set_id).eq("user_id", user_id).execute()
-    return response.data[0] if response.data else None
-
-
-def delete_group_set(user_id: int, set_id: str) -> bool:
-    """Delete group set."""
-    db = get_supabase_client()
-    response = db.table("group_sets").delete().eq("id", set_id).eq("user_id", user_id).execute()
-    return len(response.data or []) > 0
-
-
-# =========================================================
-# BROADCAST TASKS TABLE (задачи рассылок)
-# =========================================================
-
-
-def create_broadcast_task(user_id: int, message: str, groups: list, interval_minutes: int, repeats: int) -> dict:
-    """Create a new scheduled broadcast task."""
-    db = get_supabase_client()
-    task_id = str(uuid.uuid4())
-    now = time.time()
-    task = {
-        "id": task_id,
-        "user_id": user_id,
-        "message": message,
-        "groups": [int(x) for x in groups],
-        "interval_minutes": int(interval_minutes),
-        "total_repeats": int(repeats),
-        "completed_repeats": 0,
-        "status": "active",
-        "next_run": now + int(interval_minutes) * 60,
-        "created_at": now,
-        "updated_at": now,
-    }
-    db.table("broadcast_tasks").insert(task).execute()
-    return task
-
-
-def get_broadcast_task(task_id: str) -> Optional[dict]:
-    """Get task by ID."""
-    db = get_supabase_client()
-    response = db.table("broadcast_tasks").select("*").eq("id", task_id).execute()
-    return response.data[0] if response.data else None
-
-
-def get_user_broadcast_tasks(user_id: int, status: Optional[str] = None) -> list[dict]:
-    """Get all tasks for a user, optionally filtered by status."""
-    db = get_supabase_client()
-    query = db.table("broadcast_tasks").select("*").eq("user_id", user_id)
-    if status:
-        query = query.eq("status", status)
-    response = query.order("created_at", desc=True).execute()
-    return response.data or []
-
-
-def get_due_broadcast_tasks() -> list[dict]:
-    """Get all active tasks that are due for execution."""
-    db = get_supabase_client()
-    now = time.time()
-    response = db.table("broadcast_tasks").select("*").eq("status", "active").lte("next_run", now).execute()
-    return response.data or []
-
-
-def update_broadcast_task(task_id: str, **kwargs) -> Optional[dict]:
-    """Update task fields."""
-    db = get_supabase_client()
-    kwargs["updated_at"] = time.time()
-    response = db.table("broadcast_tasks").update(kwargs).eq("id", task_id).execute()
-    return response.data[0] if response.data else None
-
-
-def delete_broadcast_task(user_id: int, task_id: str) -> bool:
-    """Delete a broadcast task."""
-    db = get_supabase_client()
-    response = db.table("broadcast_tasks").delete().eq("id", task_id).eq("user_id", user_id).execute()
-    return len(response.data or []) > 0
-
-
-# =========================================================
-# BROADCAST LOGS TABLE (история отправок)
-# =========================================================
-
-
-def log_broadcast(task_id: Optional[str], user_id: int, message: str, groups: list, success_count: int, failed_count: int, errors: Optional[list] = None) -> dict:
-    """Log a broadcast attempt."""
-    db = get_supabase_client()
-    log_id = str(uuid.uuid4())
-    log_entry = {
-        "id": log_id,
-        "task_id": task_id,
-        "user_id": user_id,
-        "message": message[:1000],
-        "groups": groups,
-        "success_count": success_count,
-        "failed_count": failed_count,
-        "errors": errors or [],
-        "created_at": time.time(),
-    }
-    db.table("broadcast_logs").insert(log_entry).execute()
-    return log_entry
-
-
-def get_user_broadcast_logs(user_id: int, limit: int = 50) -> list[dict]:
-    """Get recent broadcast logs for a user."""
-    db = get_supabase_client()
-    response = db.table("broadcast_logs").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(limit).execute()
-    return response.data or []
-
-
-def get_task_broadcast_logs(task_id: str, limit: int = 50) -> list[dict]:
-    """Get broadcast logs for a specific task."""
-    db = get_supabase_client()
-    response = db.table("broadcast_logs").select("*").eq("task_id", task_id).order("created_at", desc=True).limit(limit).execute()
-    return response.data or []
-
-
-# =========================================================
-# CHAT MEMBERSHIPS TABLE (какие чаты у пользователей)
-# =========================================================
-
-
-def upsert_chat_membership(user_id: int, chat_id: int, chat_title: str, chat_type: str) -> dict:
-    """Add or update a chat membership for a user."""
-    db = get_supabase_client()
-    membership = {
-        "user_id": user_id,
-        "chat_id": chat_id,
-        "chat_title": chat_title,
-        "chat_type": chat_type,
-        "last_seen": time.time(),
-    }
-    response = db.table("chat_memberships").upsert(membership, on_conflict="user_id,chat_id").execute()
-    return response.data[0] if response.data else membership
-
-
-def get_user_chats(user_id: int) -> list[dict]:
-    """Get all chats for a user."""
-    db = get_supabase_client()
-    response = db.table("chat_memberships").select("*").eq("user_id", user_id).order("chat_title").execute()
-    return response.data or []
-
-
-def remove_chat_membership(user_id: int, chat_id: int) -> bool:
-    """Remove a chat membership."""
-    db = get_supabase_client()
-    response = db.table("chat_memberships").delete().eq("user_id", user_id).eq("chat_id", chat_id).execute()
-    return len(response.data or []) > 0
-
-
-def sync_user_chats(user_id: int, chats: list[dict]) -> int:
-    """Sync user's chat list. Returns count of synced chats."""
-    for chat in chats:
-        upsert_chat_membership(
-            user_id=user_id,
-            chat_id=int(chat["id"]),
-            chat_title=chat.get("title", "Без названия"),
-            chat_type=chat.get("type", "group"),
+        user = get_or_create_user(
+            user_id=user_data.user_id,
+            username=user_data.username,
+            first_name=user_data.first_name
         )
-    return len(chats)
+        return {"ok": True, "user": user}
+    except Exception as e:
+        logger.error(f"Error creating user: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/users/{user_id}")
+async def get_user_endpoint(user_id: int):
+    """Get user by ID."""
+    user = get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"ok": True, "user": user}
+
+
+# =========================================================
+# TEMPLATE ENDPOINTS
+# =========================================================
+
+@app.post("/users/{user_id}/templates")
+async def create_template_endpoint(user_id: int, template_data: TemplateCreate):
+    """Create a new template."""
+    try:
+        template = create_template(
+            user_id=user_id,
+            name=template_data.name,
+            message=template_data.message,
+            groups=template_data.groups
+        )
+        return {"ok": True, "template": template}
+    except Exception as e:
+        logger.error(f"Error creating template: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/users/{user_id}/templates")
+async def get_user_templates_endpoint(user_id: int):
+    """Get all templates for a user."""
+    templates = get_user_templates(user_id)
+    return {"ok": True, "templates": templates}
+
+
+@app.get("/templates/{template_id}")
+async def get_template_endpoint(template_id: str):
+    """Get template by ID."""
+    template = get_template(template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {"ok": True, "template": template}
+
+
+@app.put("/templates/{template_id}")
+async def update_template_endpoint(template_id: str, template_data: TemplateUpdate, x_user_id: int = Header(...)):
+    """Update template."""
+    try:
+        template = update_template_db(
+            user_id=x_user_id,
+            template_id=template_id,
+            name=template_data.name,
+            message=template_data.message,
+            groups=template_data.groups
+        )
+        if not template:
+            raise HTTPException(status_code=404, detail="Template not found")
+        return {"ok": True, "template": template}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating template: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/templates/{template_id}")
+async def delete_template_endpoint(template_id: str, x_user_id: int = Header(...)):
+    """Delete template."""
+    try:
+        success = delete_template(user_id=x_user_id, template_id=template_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Template not found")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting template: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================================================
+# GROUP SET ENDPOINTS
+# =========================================================
+
+@app.post("/users/{user_id}/group-sets")
+async def create_group_set_endpoint(user_id: int, group_set_data: GroupSetCreate):
+    """Create a new group set."""
+    try:
+        group_set = create_group_set(
+            user_id=user_id,
+            name=group_set_data.name,
+            groups=group_set_data.groups
+        )
+        return {"ok": True, "group_set": group_set}
+    except Exception as e:
+        logger.error(f"Error creating group set: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/users/{user_id}/group-sets")
+async def get_user_group_sets_endpoint(user_id: int):
+    """Get all group sets for a user."""
+    group_sets = get_user_group_sets(user_id)
+    return {"ok": True, "group_sets": group_sets}
+
+
+@app.put("/group-sets/{set_id}")
+async def update_group_set_endpoint(set_id: str, group_set_data: GroupSetUpdate, x_user_id: int = Header(...)):
+    """Update group set."""
+    try:
+        group_set = update_group_set_db(
+            user_id=x_user_id,
+            set_id=set_id,
+            name=group_set_data.name,
+            groups=group_set_data.groups
+        )
+        if not group_set:
+            raise HTTPException(status_code=404, detail="Group set not found")
+        return {"ok": True, "group_set": group_set}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating group set: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/group-sets/{set_id}")
+async def delete_group_set_endpoint(set_id: str, x_user_id: int = Header(...)):
+    """Delete group set."""
+    try:
+        success = delete_group_set(user_id=x_user_id, set_id=set_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Group set not found")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting group set: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================================================
+# BROADCAST TASK ENDPOINTS
+# =========================================================
+
+@app.post("/users/{user_id}/broadcast-tasks")
+async def create_broadcast_task_endpoint(user_id: int, task_data: BroadcastTaskCreate):
+    """Create a new broadcast task."""
+    try:
+        task = create_broadcast_task(
+            user_id=user_id,
+            message=task_data.message,
+            groups=task_data.groups,
+            interval_minutes=task_data.interval_minutes,
+            repeats=task_data.repeats
+        )
+        return {"ok": True, "task": task}
+    except Exception as e:
+        logger.error(f"Error creating broadcast task: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/users/{user_id}/broadcast-tasks")
+async def get_user_broadcast_tasks_endpoint(user_id: int, status: Optional[str] = None):
+    """Get all broadcast tasks for a user."""
+    tasks = get_user_broadcast_tasks(user_id, status=status)
+    return {"ok": True, "tasks": tasks}
+
+
+@app.delete("/broadcast-tasks/{task_id}")
+async def delete_broadcast_task_endpoint(task_id: str, x_user_id: int = Header(...)):
+    """Delete broadcast task."""
+    try:
+        success = delete_broadcast_task(user_id=x_user_id, task_id=task_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting broadcast task: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================================================
+# MESSAGE SENDING ENDPOINTS
+# =========================================================
+
+@app.post("/send")
+async def send_message_endpoint(message_data: MessageSend, x_worker_secret: Optional[str] = Header(None)):
+    """Send message to chats via Worker."""
+    worker_secret = os.getenv("WORKER_SECRET")
+    
+    # Validate worker secret if provided
+    if worker_secret and x_worker_secret != worker_secret:
+        raise HTTPException(status_code=401, detail="Invalid worker secret")
+    
+    try:
+        result = await worker_send_message(
+            chat_ids=message_data.chat_ids,
+            message=message_data.message
+        )
+        return {"ok": True, "result": result}
+    except Exception as e:
+        logger.error(f"Error sending message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/chats")
+async def get_chats_endpoint(x_worker_secret: Optional[str] = Header(None)):
+    """Get chats from Worker."""
+    worker_secret = os.getenv("WORKER_SECRET")
+    
+    # Validate worker secret if provided
+    if worker_secret and x_worker_secret != worker_secret:
+        raise HTTPException(status_code=401, detail="Invalid worker secret")
+    
+    try:
+        chats = await worker_get_chats()
+        return {"ok": True, "chats": chats}
+    except Exception as e:
+        logger.error(f"Error getting chats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================================================
+# LOGS ENDPOINTS
+# =========================================================
+
+@app.get("/users/{user_id}/logs")
+async def get_user_logs_endpoint(user_id: int, limit: int = 50):
+    """Get broadcast logs for a user."""
+    logs = get_user_broadcast_logs(user_id, limit=limit)
+    return {"ok": True, "logs": logs}

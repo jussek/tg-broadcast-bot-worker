@@ -55,6 +55,17 @@ async def _request(method: str, path: str, **kwargs):
             return data
 
 
+async def get_chats():
+    """Get chats from worker."""
+    data = await _request("GET", "/chats")
+    return data.get("chats", [])
+
+
+async def send_message(chat_ids: list, message: str):
+    """Send message via worker."""
+    return await _request("POST", "/send", json={"chat_ids": chat_ids, "message": message})
+
+
 def _get_redis():
     global redis
     if redis is None:
