@@ -1,1 +1,52 @@
-(empty)
+```
+# Environment variables
+.env*
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Dependencies
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.egg-info/
+
+# Build outputs
+dist/
+build/
+target/
+
+# IDE specific
+.vscode/
+.idea/
+*.iml
+
+# Python specific
+*.pyc
+*.pyo
+*.pyd
+.Python
+.coverage
+htmlcov/
+.coverage.*
+
+# Compressed files
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+```
