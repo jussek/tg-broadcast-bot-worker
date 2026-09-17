@@ -6,7 +6,6 @@ from aiohttp import web
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from upstash_redis import Redis
-from qstash import QStash as QStashClient
 
 # Настройка логирования
 logging.basicConfig(
@@ -16,28 +15,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Получение переменных окружения ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")
+TELEGRAM_SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
-QSTASH_TOKEN = os.getenv("QSTASH_TOKEN")
 WORKER_SECRET = os.getenv("WORKER_SECRET")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 # --- Проверка обязательных переменных ---
 required_vars = {
-    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
     "TELEGRAM_API_ID": TELEGRAM_API_ID,
     "TELEGRAM_API_HASH": TELEGRAM_API_HASH,
-    "SESSION_STRING": SESSION_STRING,
+    "TELEGRAM_SESSION_STRING": TELEGRAM_SESSION_STRING,
     "UPSTASH_REDIS_REST_URL": UPSTASH_REDIS_REST_URL,
     "UPSTASH_REDIS_REST_TOKEN": UPSTASH_REDIS_REST_TOKEN,
-    "QSTASH_TOKEN": QSTASH_TOKEN,
     "WORKER_SECRET": WORKER_SECRET,
 }
 
@@ -61,10 +56,8 @@ redis = Redis(
     token=UPSTASH_REDIS_REST_TOKEN,
 )
 
-qstash = QStashClient(token=QSTASH_TOKEN)
-
 client = TelegramClient(
-    StringSession(SESSION_STRING),
+    StringSession(TELEGRAM_SESSION_STRING),
     api_id=TELEGRAM_API_ID,
     api_hash=TELEGRAM_API_HASH
 )
@@ -120,45 +113,88 @@ async def handle_send(request):
         chat_ids = data.get("chat_ids", [])
         message = data.get("message", "")
         
-        if not chat_ids or not message:
-            return web.json_response({"error": "Invalid data", "ok": False}, status=400)
+        # Валидация входных данных
+        if not chat_ids:
+            return web.json_response({"error": "chat_ids is required", "ok": False, "success": 0, "failed": 0, "total": 0}, status=400)
+        if not message:
+            return web.json_response({"error": "message is required", "ok": False, "success": 0, "failed": 0, "total": 0}, status=400)
         
-        # Отправляем сообщения параллельно
-        async def send_to_chat(chat_id):
+        # Проверка максимальной длины сообщения Telegram (4096 символов)
+        if len(message) > 4096:
+            return web.json_response({"error": "Message too long (max 4096 chars)", "ok": False, "success": 0, "failed": 0, "total": 0}, status=400)
+        
+        # Удаляем дубликаты chat_id
+        unique_chat_ids = list(dict.fromkeys(chat_ids))
+        
+        errors = []
+        success_count = 0
+        
+        # Отправляем сообщения последовательно для лучшего контроля ошибок
+        for chat_id in unique_chat_ids:
             try:
                 await client.send_message(chat_id, message)
-                return True
+                success_count += 1
+                logger.info(f"✅ Сообщение отправлено в чат {chat_id}")
             except Exception as e:
-                logger.error(f"Ошибка отправки в {chat_id}: {e}")
-                return False
+                error_msg = str(e)
+                logger.error(f"Ошибка отправки в {chat_id}: {error_msg}")
+                errors.append({
+                    "chat_id": str(chat_id),
+                    "error": error_msg
+                })
         
-        results = await asyncio.gather(*[send_to_chat(cid) for cid in chat_ids], return_exceptions=True)
-        success_count = sum(1 for r in results if r is True)
+        failed_count = len(errors)
+        total_count = len(unique_chat_ids)
         
-        logger.info(f"Отправлено {success_count}/{len(chat_ids)} сообщений")
-        return web.json_response({"ok": True, "sent": success_count, "total": len(chat_ids)})
+        result = {
+            "ok": True,
+            "success": success_count,
+            "failed": failed_count,
+            "total": total_count,
+            "errors": errors
+        }
+        
+        logger.info(f"Рассылка завершена: {success_count}/{total_count} успешно, {failed_count} ошибок")
+        return web.json_response(result)
+        
     except Exception as e:
-        logger.error(f"Ошибка handle_send: {e}")
-        return web.json_response({"error": str(e), "ok": False}, status=500)
+        logger.error(f"Критическая ошибка handle_send: {e}")
+        return web.json_response({"error": str(e), "ok": False, "success": 0, "failed": 0, "total": 0, "errors": []}, status=500)
 
 async def handle_get_chats(request):
     """Получение списка чатов для Vercel"""
     worker_secret = request.headers.get("X-Worker-Secret")
     if not worker_secret or worker_secret != WORKER_SECRET:
-        return web.json_response({"error": "Unauthorized", "ok": False}, status=401)
+        return web.json_response({"error": "Unauthorized", "ok": False, "chats": []}, status=401)
     
     try:
         dialogs = await client.get_dialogs()
         chats = []
         for dialog in dialogs:
             chat = dialog.chat
-            chat_type = "channel" if chat.broadcast else ("group" if chat.megagroup else "private")
+            # Безопасное определение типа чата
+            is_broadcast = getattr(chat, "broadcast", False)
+            is_megagroup = getattr(chat, "megagroup", False)
+            
+            if is_broadcast and not is_megagroup:
+                chat_type = "channel"
+            elif is_megagroup:
+                chat_type = "group"
+            else:
+                chat_type = "private"
+            
+            # Безопасное получение title и username
+            title = getattr(chat, "title", None) or getattr(chat, "username", "Unknown")
+            username = getattr(chat, "username", None)
+            
             chats.append({
                 "id": str(chat.id),
-                "title": getattr(chat, "title", None) or getattr(chat, "username", "Unknown"),
+                "title": title,
                 "type": chat_type,
-                "username": getattr(chat, "username", None),
+                "username": username,
             })
+        
+        logger.info(f"Получено {len(chats)} чатов")
         return web.json_response({"ok": True, "chats": chats})
     except Exception as e:
         logger.error(f"Ошибка получения чатов: {e}")
@@ -171,12 +207,20 @@ async def handle_health(request):
 async def on_startup(app):
     """Запуск клиента Telegram при старте"""
     logger.info("🚀 Запуск Telegram клиента...")
-    await client.start(bot_token=TELEGRAM_BOT_TOKEN)
-    logger.info("✅ Telegram клиент подключен!")
+    await client.start()
+    
+    # Проверка авторизации пользователя
+    is_authorized = await client.is_user_authorized()
+    if not is_authorized:
+        logger.error("❌ SESSION_STRING невалидна или истекла!")
+        logger.error("Сгенерируйте новую сессию через скрипт generate_session.py")
+        sys.exit(1)
+    
+    logger.info("✅ Telegram клиент подключен и авторизован!")
     
     # Проверка подключения к Redis
     try:
-        await redis.ping()
+        redis.ping()
         logger.info("✅ Redis подключен!")
     except Exception as e:
         logger.warning(f"⚠️ Ошибка подключения к Redis: {e}")
