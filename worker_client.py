@@ -1,12 +1,16 @@
 import json
 import os
+import time
+import uuid
 from typing import Optional
 
 import aiohttp
+from upstash_redis import Redis
 
 WORKER_URL: Optional[str] = None
 WORKER_SECRET: Optional[str] = None
 TIMEOUT: Optional[aiohttp.ClientTimeout] = None
+redis: Optional[Redis] = None
 
 
 def _get_worker_url() -> str:
