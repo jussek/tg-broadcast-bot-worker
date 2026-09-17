@@ -1,4 +1,25 @@
 ```
-# Supabase temporary files
-supabase/.temp/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Dependencies
+venv/
+.venv/
+.envrc
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+*~
 ```

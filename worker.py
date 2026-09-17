@@ -1,206 +1,146 @@
-import os
+"""Persistent Telegram/Telethon worker.
+
+Run this service on Railway/Render/Fly.io/a VPS, NOT on Vercel.
+Only this process owns TELEGRAM_SESSION_STRING, so the MTProto auth key
+is never used by multiple serverless instances/IPs at the same time.
+"""
 import asyncio
-import logging
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from fastapi import FastAPI, HTTPException, Depends, Header
-from uvicorn import Config, Server
-from typing import Optional
-
-# Настройки логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Переменные окружения
-from typing import Optional
+import html
+import os
+import time
+from typing import Any
 
 from aiohttp import web
-from telethon import TelegramClient, events
+from dotenv import load_dotenv
+from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import GetHistoryRequest
-from telethon.tl.types import InputPeerUser
 
-# --- Конфигурация ---
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
-WORKER_SECRET = os.getenv("WORKER_SECRET")
-PORT = int(os.getenv("PORT", 8080))
+load_dotenv()
 
-if not all([API_ID, API_HASH, SESSION_STRING, WORKER_SECRET]):
-    logger.error("Отсутствуют необходимые переменные окружения!")
-    exit(1)
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+SESSION_STRING = os.environ["TELEGRAM_SESSION_STRING"]
+WORKER_SECRET = os.environ["WORKER_SECRET"]
+PORT = int(os.getenv("PORT", "8080"))
 
-# Инициализация клиента Telethon
+if not SESSION_STRING:
+    raise RuntimeError("TELEGRAM_SESSION_STRING is required")
+if not WORKER_SECRET:
+    raise RuntimeError("WORKER_SECRET is required")
+
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+client_lock = asyncio.Lock()
+started_at = time.time()
 
-# Инициализация FastAPI
-app = FastAPI(title="Telegram Voice Worker")
 
-async def verify_secret(x_worker_secret: Optional[str] = Header(None)):
-    if x_worker_secret != WORKER_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid secret")
-    return True
+def authorized(request: web.Request) -> bool:
+    return request.headers.get("X-Worker-Secret") == WORKER_SECRET
 
-@app.get("/health")
-async def health_check():
-    """Проверка здоровья для Railway"""
-    try:
-        is_connected = client.is_connected()
-    except Exception:
-        is_connected = False
-    
-    if not is_connected:
-        # Возвращаем 503, если клиент не подключен, чтобы Railway видел проблему
-        raise HTTPException(status_code=503, detail="Telethon client not connected")
-    
-    return {"status": "healthy", "telethon_connected": True}
 
-@app.post("/process_call", dependencies=[Depends(verify_secret)])
-async def process_call(data: dict):
-    """Эндпоинт для приема задачи на звонок"""
-    logger.info(f"Получена задача на звонок: {data}")
-    # TODO: Добавить логику звонка здесь
-    return {"status": "accepted", "message": "Call processing started"}
-
-async def run_telethon_client():
-    """Запуск клиента Telethon в фоне"""
-    logger.info("Запуск клиента Telethon...")
-    try:
-        await client.start()
-        logger.info("Клиент Telethon успешно запущен.")
-        
-        # Проверяем подключение после старта
-        if not client.is_connected():
-            logger.error("Клиент Telethon не смог подключиться после start()")
-            return
-        
-        # Держим соединение живым, пока работает сервер
-        await client.run_until_disconnected()
-    except Exception as e:
-        logger.error(f"Ошибка при запуске Telethon: {e}", exc_info=True)
-        # Не завершаем процесс полностью, даём шанс на рестарт или диагностику
-        # Но healthcheck будет показывать ошибку
-
-async def run_server():
-    """Запуск HTTP сервера"""
-    config = Config(app=app, host="0.0.0.0", port=PORT, log_level="info")
-    server = Server(config=config)
-    logger.info(f"HTTP сервер запущен на порту {PORT}")
-    await server.serve()
-
-async def main():
-    """Одновременный запуск сервера и клиента"""
-    # Запускаем сервер и клиент параллельно
-    await asyncio.gather(
-        run_server(),
-        run_telethon_client()
-    )
-    print("❌ Отсутствуют обязательные переменные окружения.")
-    sys.exit(1)
-
-# --- Логирование ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# --- Инициализация клиента Telethon ---
-# Сессия восстанавливается из строки через StringSession, а не через
-# несуществующий аргумент string_session.
-client = TelegramClient(
-    StringSession(SESSION_STRING),
-    api_id=int(API_ID),
-    api_hash=API_HASH
-)
-
-async def init_telethon():
-    try:
+async def ensure_connected() -> None:
+    if not client.is_connected():
         await client.connect()
-        if not await client.is_user_authorized():
-            logger.error("❌ Сессия невалидна или истекла (TELEGRAM_SESSION_STRING).")
-            return False
+    if not await client.is_user_authorized():
+        raise RuntimeError("Telegram session is not authorized")
 
-        logger.info("✅ Telethon клиент успешно подключен.")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Ошибка подключения Telethon: {e}")
-        return False
 
-# Глобальная переменная статуса подключения
-telethon_ready = False
+async def get_chats() -> list[dict[str, Any]]:
+    async with client_lock:
+        await ensure_connected()
+        result = []
+        async for dialog in client.iter_dialogs():
+            # Include groups, supergroups and channels. Exclude private users/bots.
+            entity = dialog.entity
+            is_channel = bool(getattr(entity, "broadcast", False))
+            is_group = bool(dialog.is_group)
+            if not (is_group or is_channel):
+                continue
+            result.append({
+                "id": str(dialog.id),
+                "title": dialog.name or "Без названия",
+                "type": "channel" if is_channel else "group",
+                "username": getattr(entity, "username", None),
+                "megagroup": bool(getattr(entity, "megagroup", False)),
+            })
+        result.sort(key=lambda x: x["title"].casefold())
+        return result
 
-async def background_telethon():
-    global telethon_ready
-    telethon_ready = await init_telethon()
-    
-    if telethon_ready:
-        @client.on(events.NewMessage(incoming=True))
-        async def handler(event):
-            logger.info(f"Получено сообщение: {event.text}")
-            # Здесь логика обработки сообщений если нужна
-            
-        await client.run_until_disconnected()
-    else:
-        logger.error("Telethon не запущен из-за ошибки авторизации.")
 
-# --- HTTP Сервер (FastAPI/aiohttp) ---
-async def health_handler(request):
-    if telethon_ready and client.is_connected():
-        return web.json_response({"status": "ok", "telethon": "connected"}, status=200)
-    else:
-        # Возвращаем 503, чтобы Railway понял, что сервис нездоров
-        return web.json_response({"status": "unavailable", "telethon": "disconnected"}, status=503)
+async def send_messages(chat_ids: list[str], message: str) -> dict[str, Any]:
+    unique_ids = list(dict.fromkeys(str(x) for x in chat_ids))
+    success = 0
+    failed = 0
+    results = []
+    async with client_lock:
+        await ensure_connected()
+        for chat_id in unique_ids:
+            try:
+                await client.send_message(int(chat_id), message)
+                success += 1
+                results.append({"id": chat_id, "ok": True})
+            except Exception as exc:
+                failed += 1
+                results.append({"id": chat_id, "ok": False, "error": str(exc)})
+            await asyncio.sleep(1.0)
+    return {"success": success, "failed": failed, "results": results}
 
-async def process_call_handler(request):
-    # Проверка секрета
-    auth_header = request.headers.get("Authorization")
-    if auth_header != f"Bearer {WORKER_SECRET}":
-        return web.json_response({"error": "Unauthorized"}, status=401)
 
+async def health(request: web.Request):
+    return web.json_response({
+        "ok": True,
+        "service": "telegram-worker",
+        "telegram_connected": client.is_connected(),
+        "uptime": int(time.time() - started_at),
+    })
+
+
+async def chats(request: web.Request):
+    if not authorized(request):
+        return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
     try:
-        data = await request.json()
-        chat_id = data.get("chat_id")
-        # Пример логики обработки звонка
-        logger.info(f"Обработка звонка для чата: {chat_id}")
-        
-        # Тут можно добавить логику отправки сообщения или звонка через Telethon
-        # if telethon_ready:
-        #     await client.send_message(...)
-            
-        return web.json_response({"status": "success", "message": "Call processed"})
-    except Exception as e:
-        logger.error(f"Ошибка обработки звонка: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        data = await get_chats()
+        return web.json_response({"ok": True, "chats": data})
+    except Exception as exc:
+        print("get_chats error:", repr(exc))
+        return web.json_response({"ok": False, "error": str(exc)}, status=502)
 
-app = web.Application()
-app.router.add_get("/health", health_handler)
-app.router.add_post("/process_call", process_call_handler)
 
-async def run_http_server():
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"🚀 HTTP сервер запущен на порту {PORT}")
-    # Держим сервер запущенным
-    while True:
-        await asyncio.sleep(3600)
+async def send(request: web.Request):
+    if not authorized(request):
+        return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+    try:
+        body = await request.json()
+        message = str(body.get("message", "")).strip()
+        chat_ids = body.get("chat_ids") or []
+        if not message:
+            return web.json_response({"ok": False, "error": "message is required"}, status=400)
+        if not chat_ids:
+            return web.json_response({"ok": False, "error": "chat_ids is required"}, status=400)
+        result = await send_messages(chat_ids, message)
+        return web.json_response({"ok": True, **result})
+    except Exception as exc:
+        print("send error:", repr(exc))
+        return web.json_response({"ok": False, "error": str(exc)}, status=502)
 
-# --- Точка входа ---
-async def main():
-    # Запускаем HTTP сервер и Telethon параллельно
-    task1 = asyncio.create_task(run_http_server())
-    task2 = asyncio.create_task(background_telethon())
-    
-    await asyncio.gather(task1, task2)
+
+async def on_startup(app: web.Application):
+    await ensure_connected()
+    me = await client.get_me()
+    print(f"Telegram worker ready: {me.id} / {me.first_name or ''}")
+
+
+async def on_cleanup(app: web.Application):
+    if client.is_connected():
+        await client.disconnect()
+
+
+app = web.Application(client_max_size=2 * 1024 * 1024)
+app.router.add_get("/", health)
+app.router.add_get("/health", health)
+app.router.add_get("/chats", chats)
+app.router.add_post("/send", send)
+app.on_startup.append(on_startup)
+app.on_cleanup.append(on_cleanup)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Остановка работы по сигналу пользователя")
-    except Exception as e:
-        logger.error(f"Критическая ошибка: {e}", exc_info=True)
-        logger.info("Остановка сервиса...")
+    web.run_app(app, host="0.0.0.0", port=PORT)

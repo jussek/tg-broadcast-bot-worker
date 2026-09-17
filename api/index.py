@@ -146,55 +146,6 @@ async def save_set(callback: CallbackQuery):
     await callback.message.edit_text(f"✅ <b>{'Объединение обновлено' if st.get('set_id') else 'Объединение создано'}</b>\n\n📦 {html.escape(item['name'])}\nЧатов: <b>{len(ids)}</b>",reply_markup=menu(),parse_mode="HTML"); await callback.answer()
 
 
-async def render_set_picker(target, user_id):
-    st=state(user_id); chats=st.get("chats",[]); selected=set(str(x) for x in st.get("set_chat_ids",[]))
-    kb=InlineKeyboardBuilder()
-    page=max(0,int(st.get("set_page",0))); page_size=40; start=page*page_size; end=min(len(chats),start+page_size)
-    for i in range(start,end):
-        c=chats[i]; cid=str(c["id"]); prefix="☑️" if cid in selected else "⬜"
-        kb.button(text=f"{prefix} {chat_label(c)[:50]}", callback_data=f"setchat:{i}")
-    if len(chats)>page_size:
-        if page>0: kb.button(text="⬅️ Предыдущая страница",callback_data="set_page:-1")
-        if end<len(chats): kb.button(text="➡️ Следующая страница",callback_data="set_page:1")
-    kb.button(text="☑️ Выбрать все",callback_data="set_all")
-    kb.button(text=f"💾 Сохранить ({len(selected)})",callback_data="save_set")
-    kb.button(text="❌ Отмена",callback_data="cancel")
-    kb.adjust(1)
-    text=f"📦 <b>Состав объединения «{html.escape(st.get('set_name',''))}»</b>\n\nВыбрано: <b>{len(selected)}</b>\nВыберите группы и каналы. При рассылке пересечения будут удаляться автоматически."
-    if isinstance(target,CallbackQuery): await target.message.edit_text(text,reply_markup=kb.as_markup(),parse_mode="HTML")
-    else: await target.answer(text,reply_markup=kb.as_markup(),parse_mode="HTML")
-
-
-@dp.callback_query(F.data.startswith("set_page:"))
-async def set_page(callback: CallbackQuery):
-    uid=callback.from_user.id; st=state(uid); delta=int(callback.data.split(":")[1]); total=len(st.get("chats",[])); pages=max(1,(total+39)//40); st["set_page"]=max(0,min(pages-1,int(st.get("set_page",0))+delta)); set_state(uid,st); await render_set_picker(callback,uid); await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("setchat:"))
-async def set_chat_toggle(callback: CallbackQuery):
-    uid=callback.from_user.id; st=state(uid); chats=st.get("chats",[])
-    try: i=int(callback.data.split(":")[1]); cid=str(chats[i]["id"])
-    except Exception: await callback.answer("Чат не найден.",show_alert=True); return
-    selected=set(st.get("set_chat_ids",[])); selected.remove(cid) if cid in selected else selected.add(cid); st["set_chat_ids"]=list(selected); set_state(uid,st)
-    await render_set_picker(callback,uid); await callback.answer()
-
-
-@dp.callback_query(F.data == "set_all")
-async def set_all(callback: CallbackQuery):
-    uid=callback.from_user.id; st=state(uid); all_ids={str(c["id"]) for c in st.get("chats",[])}; selected=set(st.get("set_chat_ids",[]))
-    st["set_chat_ids"]=[] if selected==all_ids else list(all_ids); set_state(uid,st); await render_set_picker(callback,uid); await callback.answer()
-
-
-@dp.callback_query(F.data == "save_set")
-async def save_set(callback: CallbackQuery):
-    uid=callback.from_user.id; st=state(uid); ids=unique(st.get("set_chat_ids",[]))
-    if not ids: await callback.answer("Выберите хотя бы один чат.",show_alert=True); return
-    item = update_group_set(uid, st["set_id"], st["set_name"], ids) if st.get("set_id") else create_group_set(uid, st["set_name"], ids)
-    clear_state(uid)
-    await callback.message.edit_text(f"✅ <b>{'Объединение обновлено' if st.get('set_id') else 'Объединение создано'}</b>\n\n📦 {html.escape(item['name'])}\nЧатов: <b>{len(ids)}</b>",reply_markup=menu(),parse_mode="HTML"); await callback.answer()
-
-
-async def render_chat_picker(target, user_id):
     st = state(user_id)
     chats = st.get("chats") or []
     selected = set(str(x) for x in st.get("selected_chat_ids", []))
