@@ -5,7 +5,7 @@ import asyncio
 from aiohttp import web
 from telethon import TelegramClient
 from upstash_redis import Redis
-from qstash import Client as QStashClient
+from qstash import QStash as QStashClient
 
 # Настройка логирования
 logging.basicConfig(
