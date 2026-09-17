@@ -36,6 +36,20 @@ The old session may already have been invalidated by Telegram. Generate a fresh 
 
 Do not put `TELEGRAM_SESSION_STRING` into Vercel.
 
+### How to generate a new session:
+
+1. Run the session generator script locally (on your computer, NOT on the server):
+
+```bash
+python generate_session.py
+```
+
+2. Enter your API credentials when prompted (get them from https://my.telegram.org)
+
+3. Copy the generated SESSION_STRING and add it to your worker's environment variables
+
+4. **Important**: Use this session string in ONLY ONE place - the persistent worker. Do not run multiple instances with the same session.
+
 ## 3. Worker deployment
 
 Deploy this repository to Railway, Render, Fly.io or a VPS.
