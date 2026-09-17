@@ -40,7 +40,9 @@ required_vars = {
     "TELEGRAM_API_ID": TELEGRAM_API_ID,
     "TELEGRAM_API_HASH": TELEGRAM_API_HASH,
     "SESSION_STRING": SESSION_STRING,
-    "WORKER_SECRET": WORKER_SECRET,
+    "UPSTASH_REDIS_REST_URL": UPSTASH_REDIS_REST_URL,
+    "UPSTASH_REDIS_REST_TOKEN": UPSTASH_REDIS_REST_TOKEN,
+    "QSTASH_TOKEN": QSTASH_TOKEN,
 }
 
 missing_vars = [name for name, value in required_vars.items() if not value]
