@@ -4,6 +4,7 @@ import logging
 import asyncio
 from aiohttp import web
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from upstash_redis import Redis
 from qstash import QStash as QStashClient
 
@@ -61,7 +62,7 @@ redis = Redis(
 qstash = QStashClient(token=QSTASH_TOKEN)
 
 client = TelegramClient(
-    session=SESSION_STRING,
+    StringSession(SESSION_STRING),
     api_id=TELEGRAM_API_ID,
     api_hash=TELEGRAM_API_HASH
 )
