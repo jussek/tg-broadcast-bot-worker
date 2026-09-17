@@ -28,9 +28,9 @@ from supabase import create_client, Client
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
-if not SUPABASE_URL or not (SUPABASE_KEY or SUPABASE_SERVICE_KEY):
+if not SUPABASE_URL or not (SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY):
     raise RuntimeError(
         "SUPABASE_URL and SUPABASE_ANON_KEY (or SUPABASE_SERVICE_ROLE_KEY) "
         "are required. Set them in environment variables."
