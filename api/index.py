@@ -40,8 +40,7 @@ def menu():
     kb.button(text="🔁 Последнее сообщение", callback_data="last")
     kb.button(text="📊 Мои таймеры", callback_data="tasks")
     kb.button(text="📋 Мои группы", callback_data="groups")
-    kb.button(text="⚙️ Настройки", callback_data="settings")
-    kb.adjust(2, 2, 2)
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
@@ -577,11 +576,6 @@ async def rename_set(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("delete_set:"))
 async def delete_set(callback: CallbackQuery):
     sid=callback.data.split(":",1)[1]; ok=delete_group_set(callback.from_user.id,sid); await callback.answer("Удалено." if ok else "Не найдено.",show_alert=not ok); await groups_menu(callback)
-
-
-@dp.callback_query(F.data == "settings")
-async def settings(callback: CallbackQuery):
-    await callback.message.edit_text("⚙️ <b>Настройки</b>\n\nTelegram подключён через отдельный постоянный worker.",reply_markup=menu(),parse_mode="HTML"); await callback.answer()
 
 
 @dp.callback_query(F.data == "back")
