@@ -1,40 +1,33 @@
-"""Persistent Telegram/Telethon worker.
-
-Run this service on Railway/Render/Fly.io/a VPS, NOT on Vercel.
-Only this process owns TELEGRAM_SESSION_STRING, so the MTProto auth key
-is never used by multiple serverless instances/IPs at the same time.
-"""
-import asyncio
-import html
 import os
 import sys
-import time
-from typing import Any
-
+import logging
+import asyncio
 from aiohttp import web
-from dotenv import load_dotenv
 from telethon import TelegramClient
-from telethon.sessions import StringSession
+from upstash_redis import Redis
+from qstash import Client as QStashClient
 
-load_dotenv()
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# Получение переменных окружения с проверкой
+# --- Получение переменных окружения ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
-PORT = int(os.getenv("PORT", "8080"))
 
-# Supabase
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
-
-# Redis & QStash
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 QSTASH_TOKEN = os.getenv("QSTASH_TOKEN")
 
-# Проверка обязательных переменных
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+# --- Проверка обязательных переменных ---
 required_vars = {
     "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
     "TELEGRAM_API_ID": TELEGRAM_API_ID,
@@ -45,138 +38,93 @@ required_vars = {
     "QSTASH_TOKEN": QSTASH_TOKEN,
 }
 
-missing_vars = [name for name, value in required_vars.items() if not value]
+missing_vars = [key for key, value in required_vars.items() if not value]
+
 if missing_vars:
-    print(f"❌ Отсутствуют необходимые переменные окружения: {', '.join(missing_vars)}", file=sys.stderr)
+    logger.error(f"❌ Отсутствуют необходимые переменные окружения: {', '.join(missing_vars)}")
+    logger.error("Проверьте настройки в панели Render (Environment Variables).")
     sys.exit(1)
 
 # Преобразование API_ID в int
 try:
-    API_ID = int(TELEGRAM_API_ID)
+    TELEGRAM_API_ID = int(TELEGRAM_API_ID)
 except ValueError:
-    print(f"❌ TELEGRAM_API_ID должен быть числом, получено: {TELEGRAM_API_ID}", file=sys.stderr)
+    logger.error("❌ TELEGRAM_API_ID должен быть числом!")
     sys.exit(1)
 
-API_HASH = TELEGRAM_API_HASH
+# --- Инициализация клиентов ---
+redis = Redis({
+    "url": UPSTASH_REDIS_REST_URL,
+    "token": UPSTASH_REDIS_REST_TOKEN,
+})
 
-if not SESSION_STRING:
-    raise RuntimeError("SESSION_STRING is required")
-if not WORKER_SECRET:
-    raise RuntimeError("WORKER_SECRET is required")
+qstash = QStashClient(token=QSTASH_TOKEN)
 
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-client_lock = asyncio.Lock()
-started_at = time.time()
+client = TelegramClient(
+    session=SESSION_STRING,
+    api_id=TELEGRAM_API_ID,
+    api_hash=TELEGRAM_API_HASH
+)
 
-
-def authorized(request: web.Request) -> bool:
-    return request.headers.get("X-Worker-Secret") == WORKER_SECRET
-
-
-async def ensure_connected() -> None:
-    if not client.is_connected():
-        await client.connect()
-    if not await client.is_user_authorized():
-        raise RuntimeError("Telegram session is not authorized")
-
-
-async def get_chats() -> list[dict[str, Any]]:
-    async with client_lock:
-        await ensure_connected()
-        result = []
-        async for dialog in client.iter_dialogs():
-            # Include groups, supergroups and channels. Exclude private users/bots.
-            entity = dialog.entity
-            is_channel = bool(getattr(entity, "broadcast", False))
-            is_group = bool(dialog.is_group)
-            if not (is_group or is_channel):
-                continue
-            result.append({
-                "id": str(dialog.id),
-                "title": dialog.name or "Без названия",
-                "type": "channel" if is_channel else "group",
-                "username": getattr(entity, "username", None),
-                "megagroup": bool(getattr(entity, "megagroup", False)),
-            })
-        result.sort(key=lambda x: x["title"].casefold())
-        return result
-
-
-async def send_messages(chat_ids: list[str], message: str) -> dict[str, Any]:
-    unique_ids = list(dict.fromkeys(str(x) for x in chat_ids))
-    success = 0
-    failed = 0
-    results = []
-    async with client_lock:
-        await ensure_connected()
-        for chat_id in unique_ids:
-            try:
-                await client.send_message(int(chat_id), message)
-                success += 1
-                results.append({"id": chat_id, "ok": True})
-            except Exception as exc:
-                failed += 1
-                results.append({"id": chat_id, "ok": False, "error": str(exc)})
-            await asyncio.sleep(1.0)
-    return {"success": success, "failed": failed, "results": results}
-
-
-async def health(request: web.Request):
-    return web.json_response({
-        "ok": True,
-        "service": "telegram-worker",
-        "telegram_connected": client.is_connected(),
-        "uptime": int(time.time() - started_at),
-    })
-
-
-async def chats(request: web.Request):
-    if not authorized(request):
-        return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+# --- Логика воркера ---
+async def send_message_task(message_data):
+    """Отправка сообщения через Telethon"""
     try:
-        data = await get_chats()
-        return web.json_response({"ok": True, "chats": data})
-    except Exception as exc:
-        print("get_chats error:", repr(exc))
-        return web.json_response({"ok": False, "error": str(exc)}, status=502)
+        chat_id = message_data.get("chat_id")
+        text = message_data.get("text")
+        
+        if not chat_id or not text:
+            logger.warning("Получены некорректные данные для отправки")
+            return
 
+        await client.send_message(chat_id, text)
+        logger.info(f"✅ Сообщение отправлено в чат {chat_id}")
+        
+        # Логирование в Redis (опционально)
+        await redis.set(f"log:{chat_id}", "sent")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при отправке сообщения: {e}")
 
-async def send(request: web.Request):
-    if not authorized(request):
-        return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+async def handle_webhook(request):
+    """Обработчик вебхука от QStash/Vercel"""
     try:
-        body = await request.json()
-        message = str(body.get("message", "")).strip()
-        chat_ids = body.get("chat_ids") or []
-        if not message:
-            return web.json_response({"ok": False, "error": "message is required"}, status=400)
-        if not chat_ids:
-            return web.json_response({"ok": False, "error": "chat_ids is required"}, status=400)
-        result = await send_messages(chat_ids, message)
-        return web.json_response({"ok": True, **result})
-    except Exception as exc:
-        print("send error:", repr(exc))
-        return web.json_response({"ok": False, "error": str(exc)}, status=502)
+        data = await request.json()
+        logger.info(f"Получен вебхук: {data}")
+        
+        # Запускаем отправку в фоне
+        asyncio.create_task(send_message_task(data))
+        
+        return web.json_response({"status": "accepted"})
+    except Exception as e:
+        logger.error(f"Ошибка обработки вебхука: {e}")
+        return web.json_response({"error": str(e)}, status=500)
 
+async def on_startup(app):
+    """Запуск клиента Telegram при старте"""
+    logger.info("🚀 Запуск Telegram клиента...")
+    await client.start(bot_token=TELEGRAM_BOT_TOKEN)
+    logger.info("✅ Telegram клиент подключен!")
+    
+    # Проверка подключения к Redis
+    try:
+        await redis.ping()
+        logger.info("✅ Redis подключен!")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка подключения к Redis: {e}")
 
-async def on_startup(app: web.Application):
-    await ensure_connected()
-    me = await client.get_me()
-    print(f"Telegram worker ready: {me.id} / {me.first_name or ''}")
+async def on_shutdown(app):
+    """Остановка клиента при выключении"""
+    logger.info("🛑 Остановка Telegram клиента...")
+    await client.disconnect()
 
-
-async def on_cleanup(app: web.Application):
-    if client.is_connected():
-        await client.disconnect()
-
-
-app = web.Application(client_max_size=2 * 1024 * 1024)
-app.router.add_get("/", health)
-app.router.add_get("/health", health)
-app.router.add_get("/chats", chats)
-app.router.add_post("/send", send)
+# --- Создание приложения ---
+app = web.Application()
+app.router.add_post('/webhook', handle_webhook)
 app.on_startup.append(on_startup)
-app.on_cleanup.append(on_cleanup)
+app.on_shutdown.append(on_shutdown)
 
-if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=PORT)
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 8080))
+    logger.info(f"🌐 Запуск сервера на порту {port}...")
+    web.run_app(app, host='0.0.0.0', port=port)
