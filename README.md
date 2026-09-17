@@ -27,11 +27,11 @@
 
 | Компонент | Файл | Назначение |
 |-----------|------|------------|
-| **Vercel API** | `api/index.py` | FastAPI вебхук для Telegram бота, CRUD операции, webhook |
-| **Telegram Bot** | `bot.py` | Aiogram 3.x бот с inline-кнопками и командами |
-| **Worker** | `worker.py` | Persistent процесс с Telethon, scheduler, HTTP сервер |
-| **Supabase** | `storage/supabase_storage.py` | PostgreSQL для пользователей, шаблонов, задач, логов |
-| **Upstash Redis** | `redis_storage.py`, `worker_client.py` | Блокировки задач, кэш |
+| **Vercel API** | `api/index.py` | FastAPI: CRUD операции, webhook для бота, проксирование к Worker |
+| **Telegram Bot** | `bot.py` | Aiogram 3.x бот с inline-кнопками и командами (polling или webhook) |
+| **Worker** | `worker.py` | Persistent процесс: Telethon, scheduler, HTTP сервер |
+| **Supabase** | `storage/supabase_storage.py` | PostgreSQL: пользователи, шаблоны, задачи, логи |
+| **Upstash Redis** | `redis_storage.py`, `worker.py` | Блокировки задач (locks), кэш |
 
 ## Быстрый старт
 

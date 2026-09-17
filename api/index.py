@@ -404,47 +404,81 @@ async def get_user_logs_endpoint(user_id: int, limit: int = 50):
 
 
 # =========================================================
-# TELEGRAM WEBHOOK ENDPOINT (for bot.py polling alternative)
+# TELEGRAM WEBHOOK ENDPOINT (for aiogram bot webhook)
 # =========================================================
 
-@app.post("/webhook")
+@app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
-    """Handle Telegram webhook updates.
+    """Handle Telegram webhook updates for aiogram bot.
     
-    This endpoint can be used as an alternative to bot polling.
-    It processes incoming messages and callback queries from Telegram.
+    This endpoint processes incoming messages and callback queries from Telegram
+    when the bot is configured to use webhook mode instead of polling.
     """
+    # Import bot here to avoid circular imports if bot module is not available
+    try:
+        from bot import get_bot, get_dispatcher
+        bot_instance = get_bot()
+        dp_instance = get_dispatcher()
+    except Exception as e:
+        logger.warning(f"Could not import bot module: {e}")
+        return {"ok": False, "error": "Bot not available"}
+    
+    if not bot_instance or not dp_instance:
+        logger.warning("Bot not initialized - TELEGRAM_BOT_TOKEN missing")
+        return {"ok": False, "error": "Bot not initialized"}
+    
     try:
         body = await request.json()
-        logger.info(f"Received Telegram webhook update: {body.get('update_id')}")
+        update = types.Update.model_validate(body)
         
-        # Process message
-        if 'message' in body:
-            message = body['message']
-            chat_id = message.get('chat', {}).get('id')
-            text = message.get('text', '')
-            user = message.get('from', {})
-            user_id = user.get('id')
-            first_name = user.get('first_name', '')
-            username = user.get('username', '')
-            
-            # Get or create user
-            if user_id:
-                get_or_create_user(user_id=user_id, username=username, first_name=first_name)
-            
-            # Handle commands
-            if text == '/start':
-                # Return response for /start command
-                return {
-                    "ok": True,
-                    "response": {
-                        "chat_id": chat_id,
-                        "text": f"👋 Привет, {first_name}!\n\nЭто система массовой рассылки Telegram.\n\nИспользуйте кнопки меню для управления."
-                    }
-                }
+        # Process the update through dispatcher
+        await dp_instance.feed_update(bot_instance, update)
         
         return {"ok": True}
         
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
         return {"ok": False, "error": str(e)}
+
+
+@app.post("/set-webhook")
+async def set_webhook_endpoint(webhook_url: str = None):
+    """Set Telegram webhook URL."""
+    try:
+        from bot import get_bot
+        bot_instance = get_bot()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Bot not available: {e}")
+    
+    if not bot_instance:
+        raise HTTPException(status_code=400, detail="Bot not initialized")
+    
+    if not webhook_url:
+        webhook_url = f"{VERCEL_API_URL}/telegram-webhook"
+    
+    try:
+        await bot_instance.set_webhook(webhook_url)
+        return {"ok": True, "webhook_url": webhook_url}
+    except Exception as e:
+        logger.error(f"Error setting webhook: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/delete-webhook")
+async def delete_webhook_endpoint():
+    """Delete Telegram webhook."""
+    try:
+        from bot import get_bot
+        bot_instance = get_bot()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Bot not available: {e}")
+    
+    if not bot_instance:
+        raise HTTPException(status_code=400, detail="Bot not initialized")
+    
+    try:
+        await bot_instance.delete_webhook()
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Error deleting webhook: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

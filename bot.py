@@ -1,16 +1,21 @@
-"""Telegram Bot for Broadcast System using aiogram 3.x.
+"""Telegram Bot for Broadcast System using aiogram 3.x with Webhook support.
 
 This module implements a Telegram bot that works with the Vercel API
 to provide user interaction for the broadcast system.
+
+For Vercel deployment: use webhook mode via FastAPI endpoint.
+For local/standalone deployment: use polling mode.
 """
 import os
 import logging
 from typing import Optional
+from contextlib import asynccontextmanager
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiohttp import ClientSession
+import aiohttp
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, CommandStart
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.fsm.storage.memory import MemoryStorage
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,19 +23,25 @@ logger = logging.getLogger(__name__)
 # Environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 VERCEL_API_URL = os.getenv("VERCEL_API_URL", "https://your-vercel-app.vercel.app")
+USE_POLLING = os.getenv("BOT_USE_POLLING", "false").lower() == "true"
 
 if not TELEGRAM_BOT_TOKEN:
-    logger.error("TELEGRAM_BOT_TOKEN is required. Set it in environment variables.")
-    exit(1)
-
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-dp = Dispatcher()
+    logger.warning("TELEGRAM_BOT_TOKEN not set. Bot will not start.")
+    bot = None
+    dp = None
+else:
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
 
 
 async def get_user_from_db(user_id: int, username: Optional[str] = None, first_name: Optional[str] = None):
     """Get or create user via Vercel API."""
-    async with ClientSession() as session:
-        try:
+    if not VERCEL_API_URL or VERCEL_API_URL.startswith("https://your-"):
+        logger.warning("VERCEL_API_URL not configured")
+        return None
+        
+    try:
+        async with aiohttp.ClientSession() as session:
             # Try to get existing user
             async with session.get(f"{VERCEL_API_URL}/users/{user_id}") as resp:
                 if resp.status == 200:
@@ -43,10 +54,10 @@ async def get_user_from_db(user_id: int, username: Optional[str] = None, first_n
                 "first_name": first_name
             }
             async with session.post(f"{VERCEL_API_URL}/users", json=user_data) as resp:
-                if resp.status == 200:
+                if resp.status in (200, 201):
                     return await resp.json()
-        except Exception as e:
-            logger.error(f"Error getting/creating user: {e}")
+    except Exception as e:
+        logger.error(f"Error getting/creating user: {e}")
     
     return None
 
@@ -83,13 +94,13 @@ async def cmd_start(message: types.Message):
     await message.answer(welcome_text, reply_markup=keyboard)
 
 
-@dp.callback_query(lambda c: c.data == "templates")
+@dp.callback_query(F.data == "templates")
 async def cb_templates(callback: types.CallbackQuery):
     """Show templates menu."""
     user_id = callback.from_user.id
     
-    async with ClientSession() as session:
-        try:
+    try:
+        async with aiohttp.ClientSession() as session:
             async with session.get(f"{VERCEL_API_URL}/users/{user_id}/templates") as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -107,20 +118,20 @@ async def cb_templates(callback: types.CallbackQuery):
                     await callback.message.answer(text)
                 else:
                     await callback.message.answer("❌ Ошибка получения шаблонов")
-        except Exception as e:
-            logger.error(f"Error getting templates: {e}")
-            await callback.message.answer("❌ Ошибка получения шаблонов")
+    except Exception as e:
+        logger.error(f"Error getting templates: {e}")
+        await callback.message.answer("❌ Ошибка получения шаблонов")
     
     await callback.answer()
 
 
-@dp.callback_query(lambda c: c.data == "groups")
+@dp.callback_query(F.data == "groups")
 async def cb_groups(callback: types.CallbackQuery):
     """Show groups menu."""
     user_id = callback.from_user.id
     
-    async with ClientSession() as session:
-        try:
+    try:
+        async with aiohttp.ClientSession() as session:
             async with session.get(f"{VERCEL_API_URL}/users/{user_id}/group-sets") as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -140,20 +151,20 @@ async def cb_groups(callback: types.CallbackQuery):
                     await callback.message.answer(text)
                 else:
                     await callback.message.answer("❌ Ошибка получения наборов групп")
-        except Exception as e:
-            logger.error(f"Error getting group sets: {e}")
-            await callback.message.answer("❌ Ошибка получения наборов групп")
+    except Exception as e:
+        logger.error(f"Error getting group sets: {e}")
+        await callback.message.answer("❌ Ошибка получения наборов групп")
     
     await callback.answer()
 
 
-@dp.callback_query(lambda c: c.data == "broadcasts")
+@dp.callback_query(F.data == "broadcasts")
 async def cb_broadcasts(callback: types.CallbackQuery):
     """Show broadcasts menu."""
     user_id = callback.from_user.id
     
-    async with ClientSession() as session:
-        try:
+    try:
+        async with aiohttp.ClientSession() as session:
             async with session.get(f"{VERCEL_API_URL}/users/{user_id}/broadcast-tasks") as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -178,20 +189,20 @@ async def cb_broadcasts(callback: types.CallbackQuery):
                     await callback.message.answer(text)
                 else:
                     await callback.message.answer("❌ Ошибка получения задач")
-        except Exception as e:
-            logger.error(f"Error getting broadcast tasks: {e}")
-            await callback.message.answer("❌ Ошибка получения задач")
+    except Exception as e:
+        logger.error(f"Error getting broadcast tasks: {e}")
+        await callback.message.answer("❌ Ошибка получения задач")
     
     await callback.answer()
 
 
-@dp.callback_query(lambda c: c.data == "history")
+@dp.callback_query(F.data == "history")
 async def cb_history(callback: types.CallbackQuery):
     """Show history menu."""
     user_id = callback.from_user.id
     
-    async with ClientSession() as session:
-        try:
+    try:
+        async with aiohttp.ClientSession() as session:
             async with session.get(f"{VERCEL_API_URL}/users/{user_id}/logs?limit=10") as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -209,24 +220,25 @@ async def cb_history(callback: types.CallbackQuery):
                     await callback.message.answer(text)
                 else:
                     await callback.message.answer("❌ Ошибка получения истории")
-        except Exception as e:
-            logger.error(f"Error getting logs: {e}")
-            await callback.message.answer("❌ Ошибка получения истории")
+    except Exception as e:
+        logger.error(f"Error getting logs: {e}")
+        await callback.message.answer("❌ Ошибка получения истории")
     
     await callback.answer()
 
 
-@dp.callback_query(lambda c: c.data == "sync_chats")
+@dp.callback_query(F.data == "sync_chats")
 async def cb_sync_chats(callback: types.CallbackQuery):
     """Sync user chats from Telegram worker."""
     user_id = callback.from_user.id
     
     await callback.message.answer("🔄 Синхронизация чатов...")
     
-    async with ClientSession() as session:
-        try:
+    try:
+        async with aiohttp.ClientSession() as session:
             # Get chats from worker via Vercel API
-            async with session.get(f"{VERCEL_API_URL}/chats") as resp:
+            headers = {"X-Worker-Secret": os.getenv("WORKER_SECRET", "")}
+            async with session.get(f"{VERCEL_API_URL}/chats", headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     chats = data.get("chats", [])
@@ -236,7 +248,7 @@ async def cb_sync_chats(callback: types.CallbackQuery):
                         f"{VERCEL_API_URL}/users/{user_id}/sync-chats",
                         json={"chats": chats}
                     ) as sync_resp:
-                        if sync_resp.status == 200:
+                        if sync_resp.status in (200, 201):
                             await callback.message.answer(
                                 f"✅ Синхронизировано {len(chats)} чатов"
                             )
@@ -244,19 +256,40 @@ async def cb_sync_chats(callback: types.CallbackQuery):
                             await callback.message.answer("❌ Ошибка сохранения чатов")
                 else:
                     await callback.message.answer("❌ Ошибка получения чатов от воркера")
-        except Exception as e:
-            logger.error(f"Error syncing chats: {e}")
-            await callback.message.answer(f"❌ Ошибка синхронизации: {e}")
+    except Exception as e:
+        logger.error(f"Error syncing chats: {e}")
+        await callback.message.answer(f"❌ Ошибка синхронизации: {e}")
     
     await callback.answer()
 
 
-async def main():
-    """Main function to start the bot."""
-    logger.info("Starting Telegram bot...")
-    await dp.start_polling(bot)
+async def on_startup():
+    """Called on bot startup."""
+    logger.info("Telegram bot started")
+    if bot and USE_POLLING:
+        await bot.delete_webhook()
+        logger.info("Webhook deleted, using polling mode")
 
 
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+async def on_shutdown():
+    """Called on bot shutdown."""
+    logger.info("Telegram bot shutting down")
+    if bot:
+        await bot.session.close()
+
+
+def setup_bot():
+    """Setup bot handlers and return dispatcher."""
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    return dp
+
+
+def get_bot():
+    """Get bot instance."""
+    return bot
+
+
+def get_dispatcher():
+    """Get dispatcher instance."""
+    return dp
