@@ -1,1 +1,43 @@
-(worker.py is a source file, and there are no build artifacts, dependencies, or temporary files in the changes)
+```
+# Dependencies
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Logs
+*.log
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python specific
+*.py[cod]
+*$py.class
+*.so
+.Python
+```
