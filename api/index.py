@@ -8,13 +8,14 @@ It handles:
 - Group set management
 - Broadcast task management
 - Worker communication
+- Telegram Bot Webhook
 """
 import os
 import logging
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 
 from storage.supabase_storage import (
@@ -114,6 +115,13 @@ class BroadcastTaskCreate(BaseModel):
 class MessageSend(BaseModel):
     chat_ids: list
     message: str
+
+
+# Telegram Webhook models
+class TelegramWebhookUpdate(BaseModel):
+    update_id: int
+    message: Optional[dict] = None
+    callback_query: Optional[dict] = None
 
 
 # =========================================================
@@ -393,3 +401,50 @@ async def get_user_logs_endpoint(user_id: int, limit: int = 50):
     """Get broadcast logs for a user."""
     logs = get_user_broadcast_logs(user_id, limit=limit)
     return {"ok": True, "logs": logs}
+
+
+# =========================================================
+# TELEGRAM WEBHOOK ENDPOINT (for bot.py polling alternative)
+# =========================================================
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    """Handle Telegram webhook updates.
+    
+    This endpoint can be used as an alternative to bot polling.
+    It processes incoming messages and callback queries from Telegram.
+    """
+    try:
+        body = await request.json()
+        logger.info(f"Received Telegram webhook update: {body.get('update_id')}")
+        
+        # Process message
+        if 'message' in body:
+            message = body['message']
+            chat_id = message.get('chat', {}).get('id')
+            text = message.get('text', '')
+            user = message.get('from', {})
+            user_id = user.get('id')
+            first_name = user.get('first_name', '')
+            username = user.get('username', '')
+            
+            # Get or create user
+            if user_id:
+                get_or_create_user(user_id=user_id, username=username, first_name=first_name)
+            
+            # Handle commands
+            if text == '/start':
+                # Return response for /start command
+                return {
+                    "ok": True,
+                    "response": {
+                        "chat_id": chat_id,
+                        "text": f"👋 Привет, {first_name}!\n\nЭто система массовой рассылки Telegram.\n\nИспользуйте кнопки меню для управления."
+                    }
+                }
+        
+        return {"ok": True}
+        
+    except Exception as e:
+        logger.error(f"Error processing webhook: {e}")
+        return {"ok": False, "error": str(e)}
