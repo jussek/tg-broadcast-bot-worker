@@ -24,6 +24,7 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 QSTASH_TOKEN = os.getenv("QSTASH_TOKEN")
+WORKER_SECRET = os.getenv("WORKER_SECRET")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
@@ -37,6 +38,7 @@ required_vars = {
     "UPSTASH_REDIS_REST_URL": UPSTASH_REDIS_REST_URL,
     "UPSTASH_REDIS_REST_TOKEN": UPSTASH_REDIS_REST_TOKEN,
     "QSTASH_TOKEN": QSTASH_TOKEN,
+    "WORKER_SECRET": WORKER_SECRET,
 }
 
 missing_vars = [key for key, value in required_vars.items() if not value]
@@ -89,6 +91,12 @@ async def send_message_task(message_data):
 
 async def handle_webhook(request):
     """Обработчик вебхука от QStash/Vercel"""
+    # Проверка секрета
+    worker_secret = request.headers.get("X-Worker-Secret")
+    if not worker_secret or worker_secret != WORKER_SECRET:
+        logger.warning("Попытка доступа без правильного секрета")
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
     try:
         data = await request.json()
         logger.info(f"Получен вебхук: {data}")
@@ -100,6 +108,65 @@ async def handle_webhook(request):
     except Exception as e:
         logger.error(f"Ошибка обработки вебхука: {e}")
         return web.json_response({"error": str(e)}, status=500)
+
+async def handle_send(request):
+    """Обработчик отправки сообщений от Vercel"""
+    worker_secret = request.headers.get("X-Worker-Secret")
+    if not worker_secret or worker_secret != WORKER_SECRET:
+        return web.json_response({"error": "Unauthorized", "ok": False}, status=401)
+    
+    try:
+        data = await request.json()
+        chat_ids = data.get("chat_ids", [])
+        message = data.get("message", "")
+        
+        if not chat_ids or not message:
+            return web.json_response({"error": "Invalid data", "ok": False}, status=400)
+        
+        # Отправляем сообщения параллельно
+        async def send_to_chat(chat_id):
+            try:
+                await client.send_message(chat_id, message)
+                return True
+            except Exception as e:
+                logger.error(f"Ошибка отправки в {chat_id}: {e}")
+                return False
+        
+        results = await asyncio.gather(*[send_to_chat(cid) for cid in chat_ids], return_exceptions=True)
+        success_count = sum(1 for r in results if r is True)
+        
+        logger.info(f"Отправлено {success_count}/{len(chat_ids)} сообщений")
+        return web.json_response({"ok": True, "sent": success_count, "total": len(chat_ids)})
+    except Exception as e:
+        logger.error(f"Ошибка handle_send: {e}")
+        return web.json_response({"error": str(e), "ok": False}, status=500)
+
+async def handle_get_chats(request):
+    """Получение списка чатов для Vercel"""
+    worker_secret = request.headers.get("X-Worker-Secret")
+    if not worker_secret or worker_secret != WORKER_SECRET:
+        return web.json_response({"error": "Unauthorized", "ok": False}, status=401)
+    
+    try:
+        dialogs = await client.get_dialogs()
+        chats = []
+        for dialog in dialogs:
+            chat = dialog.chat
+            chat_type = "channel" if chat.broadcast else ("group" if chat.megagroup else "private")
+            chats.append({
+                "id": str(chat.id),
+                "title": getattr(chat, "title", None) or getattr(chat, "username", "Unknown"),
+                "type": chat_type,
+                "username": getattr(chat, "username", None),
+            })
+        return web.json_response({"ok": True, "chats": chats})
+    except Exception as e:
+        logger.error(f"Ошибка получения чатов: {e}")
+        return web.json_response({"error": str(e), "ok": False, "chats": []}, status=500)
+
+async def handle_health(request):
+    """Health check endpoint"""
+    return web.json_response({"status": "ok"})
 
 async def on_startup(app):
     """Запуск клиента Telegram при старте"""
@@ -121,7 +188,10 @@ async def on_shutdown(app):
 
 # --- Создание приложения ---
 app = web.Application()
-app.router.add_post('/webhook', handle_webhook)
+app.router.add_post('/webhook', handle_webhook)  # Для QStash
+app.router.add_post('/send', handle_send)        # Для Vercel API
+app.router.add_get('/chats', handle_get_chats)   # Для Vercel API
+app.router.add_get('/health', handle_health)     # Health check для Render
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 
