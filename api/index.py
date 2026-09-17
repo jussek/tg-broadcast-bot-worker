@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
+from aiogram.types import Update
 
 from storage.supabase_storage import (
     get_or_create_user,
@@ -453,8 +454,13 @@ async def set_webhook_endpoint(webhook_url: str = None):
     if not bot_instance:
         raise HTTPException(status_code=400, detail="Bot not initialized")
     
+    # Get Vercel URL from environment or use provided/default
+    vercel_url = os.getenv("VERCEL_URL") or os.getenv("VERCEL_API_URL")
     if not webhook_url:
-        webhook_url = f"{VERCEL_API_URL}/telegram-webhook"
+        if vercel_url:
+            webhook_url = f"https://{vercel_url}/telegram-webhook"
+        else:
+            raise HTTPException(status_code=400, detail="VERCEL_URL not set and no webhook_url provided")
     
     try:
         await bot_instance.set_webhook(webhook_url)
