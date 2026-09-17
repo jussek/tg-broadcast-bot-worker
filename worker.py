@@ -7,6 +7,7 @@ is never used by multiple serverless instances/IPs at the same time.
 import asyncio
 import html
 import os
+import sys
 import time
 from typing import Any
 
@@ -17,14 +18,48 @@ from telethon.sessions import StringSession
 
 load_dotenv()
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-SESSION_STRING = os.environ["TELEGRAM_SESSION_STRING"]
-WORKER_SECRET = os.environ["WORKER_SECRET"]
+# Получение переменных окружения с проверкой
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
+SESSION_STRING = os.getenv("SESSION_STRING")
+WORKER_SECRET = os.getenv("WORKER_SECRET")
 PORT = int(os.getenv("PORT", "8080"))
 
+# Supabase
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+# Redis & QStash
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+QSTASH_TOKEN = os.getenv("QSTASH_TOKEN")
+
+# Проверка обязательных переменных
+required_vars = {
+    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+    "TELEGRAM_API_ID": TELEGRAM_API_ID,
+    "TELEGRAM_API_HASH": TELEGRAM_API_HASH,
+    "SESSION_STRING": SESSION_STRING,
+    "WORKER_SECRET": WORKER_SECRET,
+}
+
+missing_vars = [name for name, value in required_vars.items() if not value]
+if missing_vars:
+    print(f"❌ Отсутствуют необходимые переменные окружения: {', '.join(missing_vars)}", file=sys.stderr)
+    sys.exit(1)
+
+# Преобразование API_ID в int
+try:
+    API_ID = int(TELEGRAM_API_ID)
+except ValueError:
+    print(f"❌ TELEGRAM_API_ID должен быть числом, получено: {TELEGRAM_API_ID}", file=sys.stderr)
+    sys.exit(1)
+
+API_HASH = TELEGRAM_API_HASH
+
 if not SESSION_STRING:
-    raise RuntimeError("TELEGRAM_SESSION_STRING is required")
+    raise RuntimeError("SESSION_STRING is required")
 if not WORKER_SECRET:
     raise RuntimeError("WORKER_SECRET is required")
 
