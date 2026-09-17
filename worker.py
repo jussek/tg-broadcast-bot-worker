@@ -53,10 +53,10 @@ except ValueError:
     sys.exit(1)
 
 # --- Инициализация клиентов ---
-redis = Redis({
-    "url": UPSTASH_REDIS_REST_URL,
-    "token": UPSTASH_REDIS_REST_TOKEN,
-})
+redis = Redis(
+    url=UPSTASH_REDIS_REST_URL,
+    token=UPSTASH_REDIS_REST_TOKEN,
+)
 
 qstash = QStashClient(token=QSTASH_TOKEN)
 
