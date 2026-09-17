@@ -1,0 +1,8 @@
+[project]
+name = "telegram-broadcast-bot"
+version = "1.0.0"
+description = "Telegram Broadcast Bot with Vercel + Supabase + Redis + Persistent Worker"
+requires-python = ">=3.10,<3.13"
+
+[tool.uv]
+dev-dependencies = []
