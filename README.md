@@ -1,146 +1,136 @@
-# Telegram Broadcast Bot — Vercel + Supabase + Telegram Worker + Redis
+# Telegram Broadcast Bot
 
-## Architecture
+Система массовой рассылки сообщений в Telegram через MTProto (Telethon).
 
-- **Vercel**: Telegram Bot webhook, UI, business logic.
-- **Supabase**: PostgreSQL database for users, templates, group sets, broadcast tasks, logs, and chat memberships.
-- **Upstash Redis**: real-time UI state (pagination, selected chats), locks for concurrent task processing, QStash deduplication.
-- **Persistent worker** (`worker.py`): the ONLY process that owns the Telethon session and sends messages via MTProto.
-- **QStash**: scheduled task execution (cron-like triggers for recurring broadcasts).
+## Архитектура
 
-This architecture prevents Telegram's `authorization key was used under two different IP addresses simultaneously` error by ensuring only the persistent worker uses the MTProto session.
+```
+┌─────────────┐      HTTP       ┌──────────────────┐
+│   Vercel    │ ◄─────────────► │  Worker (Render) │
+│  FastAPI    │                 │   Telethon       │
+│  (api/)     │                 │   aiohttp        │
+└──────┬──────┘                 └────────┬─────────┘
+       │                                  │
+       │         ┌────────────┐           │
+       ├────────►│  Supabase  │◄──────────┘
+       │         │ PostgreSQL │
+       │         └────────────┘
+       │
+       │         ┌────────────┐
+       └────────►│ Upstash    │
+                 │ Redis      │
+                 └────────────┘
+```
 
-## 1. Supabase Setup
+### Компоненты
 
-### 1.1 Create a Supabase project
+| Компонент | Файл | Назначение |
+|-----------|------|------------|
+| **Vercel API** | `api/index.py` | FastAPI вебхук для Telegram бота, CRUD операции |
+| **Worker** | `worker.py` | Единственный процесс с Telethon для отправки через MTProto |
+| **Supabase** | `storage/supabase_storage.py` | PostgreSQL для пользователей, шаблонов, задач, логов |
+| **Upstash Redis** | `redis_storage.py`, `worker_client.py` | Кэш, UI состояние, блокировки задач |
+| **QStash** | (опционально) | Планировщик периодических рассылок |
 
-1. Go to [supabase.com](https://supabase.com) and create a new project.
-2. Wait for the database to be ready.
+## Быстрый старт
 
-### 1.2 Run the SQL schema
+### 1. Supabase
 
-1. Open the SQL Editor in your Supabase dashboard.
-2. Copy the contents of `supabase_schema.sql` from this repository.
-3. Paste and run the SQL to create all tables, indexes, and RLS policies.
+1. Создайте проект на https://supabase.com
+2. В SQL Editor выполните `supabase_schema.sql`
+3. Скопируйте `SUPABASE_URL` и `SUPABASE_SERVICE_ROLE_KEY`
 
-### 1.3 Get Supabase credentials
+### 2. Upstash Redis
 
-In your Supabase project settings:
-- **Project URL**: Found in Settings → API
-- **Anon Public Key**: Found in Settings → API (for client-side use)
-- **Service Role Key**: Found in Settings → API (for server-side use, keep secret!)
+1. Создайте базу на https://upstash.com
+2. Скопируйте REST URL и токен
 
-## 2. Generate a NEW Telethon session
-
-The old session may already have been invalidated by Telegram. Generate a fresh session **once**, then put it only on the worker.
-
-Do not put `TELEGRAM_SESSION_STRING` into Vercel.
-
-### How to generate a new session:
-
-1. Run the session generator script locally (on your computer, NOT on the server):
+### 3. Генерация SESSION_STRING
 
 ```bash
 python generate_session.py
 ```
 
-2. Enter your API credentials when prompted (get them from https://my.telegram.org)
+Введите API ID и API Hash из https://my.telegram.org/apps
 
-3. Copy the generated SESSION_STRING and add it to your worker's environment variables
+### 4. Worker (Render/Railway)
 
-4. **Important**: Use this session string in ONLY ONE place - the persistent worker. Do not run multiple instances with the same session.
+**Переменные окружения:**
+- `TELEGRAM_API_ID` — числовой ID приложения
+- `TELEGRAM_API_HASH` — хэш приложения
+- `TELEGRAM_SESSION_STRING` — строка сессии (только здесь!)
+- `UPSTASH_REDIS_REST_URL` — URL Redis
+- `UPSTASH_REDIS_REST_TOKEN` — токен Redis
+- `WORKER_SECRET` — случайный секрет для авторизации запросов
+- `SUPABASE_URL` — URL проекта Supabase
+- `SUPABASE_SERVICE_ROLE_KEY` — сервисный ключ
 
-## 3. Worker deployment
-
-Deploy this repository to Railway, Render, Fly.io or a VPS.
-
-Worker environment:
-
-```text
-API_ID=
-API_HASH=
-TELEGRAM_SESSION_STRING=
-WORKER_SECRET=<long random secret>
-PORT=8080
-SUPABASE_URL=
-SUPABASE_SERVICE_ROLE_KEY=
-```
-
-Start command:
-
+**Запуск:**
 ```bash
+pip install -r requirements.txt
 python worker.py
 ```
 
-Health endpoint:
+### 5. Vercel API
 
-```text
-/health
+**Переменные окружения (без TELEGRAM_SESSION_STRING!):**
+- `TELEGRAM_WORKER_URL` — URL вашего воркера (например, `https://your-worker.onrender.com`)
+- `WORKER_SECRET` — тот же секрет, что у воркера
+- `SUPABASE_URL` — URL проекта Supabase
+- `SUPABASE_SERVICE_ROLE_KEY` — сервисный ключ
+- `UPSTASH_REDIS_REST_URL` — URL Redis (опционально)
+- `UPSTASH_REDIS_REST_TOKEN` — токен Redis (опционально)
+
+**Деплой:**
+```bash
+vercel --prod
 ```
 
-## 4. Vercel environment
+## API Endpoints
 
-Vercel needs:
+### Пользователи
+- `POST /users` — создать пользователя
+- `GET /users/{user_id}` — получить пользователя
 
-```text
-BOT_TOKEN=
-SUPABASE_URL=
-SUPABASE_ANON_KEY=
-SUPABASE_SERVICE_ROLE_KEY=
-UPSTASH_REDIS_REST_URL=
-UPSTASH_REDIS_REST_TOKEN=
-APP_URL=https://your-project.vercel.app
-TELEGRAM_WORKER_URL=https://your-worker.example.com
-WORKER_SECRET=<same secret as worker>
-QSTASH_TOKEN=
-QSTASH_SECRET=
-```
+### Шаблоны
+- `POST /users/{user_id}/templates` — создать шаблон
+- `GET /users/{user_id}/templates` — список шаблонов
+- `PUT /templates/{template_id}` — обновить шаблон
+- `DELETE /templates/{template_id}` — удалить шаблон
 
-**Do not set `API_ID`, `API_HASH` or `TELEGRAM_SESSION_STRING` on Vercel.**
+### Группы чатов
+- `POST /users/{user_id}/group-sets` — создать набор групп
+- `GET /users/{user_id}/group-sets` — список наборов
+- `PUT /group-sets/{set_id}` — обновить набор
+- `DELETE /group-sets/{set_id}` — удалить набор
 
-## 5. Chat groups / объединения
+### Задачи рассылок
+- `POST /users/{user_id}/broadcast-tasks` — создать задачу
+- `GET /users/{user_id}/broadcast-tasks` — список задач
+- `DELETE /broadcast-tasks/{task_id}` — удалить задачу
 
-An объединение stores Telegram chat IDs only. It can contain groups, supergroups and channels. Multiple объединения can be selected together. The final recipient list is a set/union of IDs, so overlapping объединения never cause duplicate sends.
+### Отправка сообщений
+- `POST /send` — отправить сообщения (через воркер)
+- `GET /chats` — получить список чатов (через воркер)
 
-## 6. Data Storage Strategy
+### Логи
+- `GET /users/{user_id}/logs` — история отправок
 
-### Supabase (PostgreSQL) - Persistent Data
-- **users**: User profiles and settings
-- **templates**: Message templates with names
-- **group_sets**: Predefined groups of chats (объединения)
-- **broadcast_tasks**: Scheduled recurring broadcasts
-- **broadcast_logs**: History of all broadcast attempts with success/failure counts
-- **chat_memberships**: Which chats belong to which users (for analytics)
+## Безопасность
 
-### Redis - Ephemeral/Real-time Data
-- UI state during user sessions (pagination, selected chats)
-- Task locks for preventing concurrent execution
-- QStash deduplication keys
+1. **SESSION_STRING** хранится только на воркере, никогда не передаётся в Vercel
+2. **WORKER_SECRET** используется для авторизации запросов между Vercel и воркером
+3. **RLS политики** в Supabase ограничивают доступ пользователей к их данным
 
-## 7. Important
+## Важные замечания
 
-Do not run another Telethon process with the same session. Only the persistent worker may use the session.
+⚠️ **Один экземпляр воркера**: Запускайте `worker.py` только на одном хосте. 
+Несколько экземпляров с одной сессией приведут к конфликтам IP и бану.
 
-## 8. Development Notes
+⚠️ **Лимиты Telegram**: 
+- Максимальная длина сообщения: 4096 символов
+- Лимиты на отправку зависят от возраста аккаунта
 
-### Using Supabase in local development
+## Лицензия
 
-Create a `.env` file with:
-
-```text
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_ANON_KEY=your-anon-key
-SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
-```
-
-### Migration from Redis-only to Supabase + Redis
-
-The existing `redis_storage.py` continues to work for:
-- Real-time UI state (`user_state_key`)
-- Task locks (`acquire_task_lock`, `release_task_lock`)
-
-New code should use `supabase_storage.py` for:
-- Templates (`create_template`, `get_user_templates`, etc.)
-- Group sets (`create_group_set`, `get_user_group_sets`, etc.)
-- Broadcast tasks (`create_broadcast_task`, `get_due_broadcast_tasks`, etc.)
-- Logs (`log_broadcast`, `get_user_broadcast_logs`, etc.)
+MIT
