@@ -9,6 +9,7 @@
 │   Vercel    │ ◄─────────────► │  Worker (Render) │
 │  FastAPI    │                 │   Telethon       │
 │  (api/)     │                 │   aiohttp        │
+│  + Bot      │                 │   Scheduler      │
 └──────┬──────┘                 └────────┬─────────┘
        │                                  │
        │         ┌────────────┐           │
@@ -26,11 +27,11 @@
 
 | Компонент | Файл | Назначение |
 |-----------|------|------------|
-| **Vercel API** | `api/index.py` | FastAPI вебхук для Telegram бота, CRUD операции |
-| **Worker** | `worker.py` | Единственный процесс с Telethon для отправки через MTProto |
+| **Vercel API** | `api/index.py` | FastAPI вебхук для Telegram бота, CRUD операции, webhook |
+| **Telegram Bot** | `bot.py` | Aiogram 3.x бот с inline-кнопками и командами |
+| **Worker** | `worker.py` | Persistent процесс с Telethon, scheduler, HTTP сервер |
 | **Supabase** | `storage/supabase_storage.py` | PostgreSQL для пользователей, шаблонов, задач, логов |
-| **Upstash Redis** | `redis_storage.py`, `worker_client.py` | Кэш, UI состояние, блокировки задач |
-| **QStash** | (опционально) | Планировщик периодических рассылок |
+| **Upstash Redis** | `redis_storage.py`, `worker_client.py` | Блокировки задач, кэш |
 
 ## Быстрый старт
 
@@ -53,7 +54,7 @@ python generate_session.py
 
 Введите API ID и API Hash из https://my.telegram.org/apps
 
-### 4. Worker (Render/Railway)
+### 4. Worker (Render/Railway/VPS)
 
 **Переменные окружения:**
 - `TELEGRAM_API_ID` — числовой ID приложения
@@ -64,12 +65,20 @@ python generate_session.py
 - `WORKER_SECRET` — случайный секрет для авторизации запросов
 - `SUPABASE_URL` — URL проекта Supabase
 - `SUPABASE_SERVICE_ROLE_KEY` — сервисный ключ
+- `PORT` — порт (по умолчанию 8080)
 
 **Запуск:**
 ```bash
 pip install -r requirements.txt
 python worker.py
 ```
+
+Worker запустит:
+- Telegram клиент (Telethon)
+- HTTP сервер на указанном порту
+- Scheduler для периодических задач
+
+**Health check:** `GET /health`
 
 ### 5. Vercel API
 
@@ -78,13 +87,24 @@ python worker.py
 - `WORKER_SECRET` — тот же секрет, что у воркера
 - `SUPABASE_URL` — URL проекта Supabase
 - `SUPABASE_SERVICE_ROLE_KEY` — сервисный ключ
-- `UPSTASH_REDIS_REST_URL` — URL Redis (опционально)
-- `UPSTASH_REDIS_REST_TOKEN` — токен Redis (опционально)
+- `TELEGRAM_BOT_TOKEN` — токен Telegram бота (от @BotFather)
+- `VERCEL_API_URL` — URL вашего Vercel приложения
 
 **Деплой:**
 ```bash
 vercel --prod
 ```
+
+### 6. Telegram Bot
+
+**Запуск бота:**
+```bash
+export TELEGRAM_BOT_TOKEN="your_bot_token"
+export VERCEL_API_URL="https://your-vercel-app.vercel.app"
+python bot.py
+```
+
+Или используйте webhook режим через Vercel.
 
 ## API Endpoints
 
@@ -116,6 +136,9 @@ vercel --prod
 ### Логи
 - `GET /users/{user_id}/logs` — история отправок
 
+### Webhook
+- `POST /webhook` — Telegram webhook для бота
+
 ## Безопасность
 
 1. **SESSION_STRING** хранится только на воркере, никогда не передаётся в Vercel
@@ -130,6 +153,19 @@ vercel --prod
 ⚠️ **Лимиты Telegram**: 
 - Максимальная длина сообщения: 4096 символов
 - Лимиты на отправку зависят от возраста аккаунта
+
+⚠️ **Scheduler**: Работает только на persistent Worker, не на Vercel.
+
+## Повторяющиеся рассылки
+
+При создании задачи указывается:
+- `interval_minutes` — интервал между повторами в минутах
+- `repeats` — общее количество повторов
+
+Пример: `interval_minutes=60`, `repeats=5` означает:
+- Первая отправка через 60 минут после создания
+- Затем ещё 4 отправки с интервалом 60 минут
+- После 5-й отправки статус меняется на `completed`
 
 ## Лицензия
 
