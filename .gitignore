@@ -1,43 +1,4 @@
 ```
-# Dependencies
-.venv/
-venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Environment
-.env
-.env.local
-*.env.*
-
-# Logs
-*.log
-
-# Build artifacts
-dist/
-build/
-*.egg-info/
-
-# Editors
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Python specific
-*.py[cod]
-*$py.class
-*.so
-.Python
+# Supabase temporary files
+supabase/.temp/
 ```
