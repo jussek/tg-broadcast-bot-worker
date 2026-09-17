@@ -1,20 +1,8 @@
 [project]
-name = "tg-broadcast-bot-worker"
-version = "0.1.0"
-description = "Telegram broadcast bot worker and Vercel API runtime"
-requires-python = ">=3.11"
-dependencies = [
-  "aiohttp>=3.9.0",
-  "aiogram>=3.4.0",
-  "telethon>=1.34.0",
-  "fastapi>=0.109.0",
-  "uvicorn[standard]>=0.27.0",
-  "python-dotenv>=1.0.0",
-  "supabase>=2.3.0",
-  "upstash-redis>=1.0.0",
-  "qstash>=0.3.0",
-]
+name = "telegram-broadcast-bot"
+version = "1.0.0"
+description = "Telegram Broadcast Bot with Vercel + Supabase + Redis + Persistent Worker"
+requires-python = ">=3.10,<3.13"
 
-[build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+[tool.uv]
+dev-dependencies = []

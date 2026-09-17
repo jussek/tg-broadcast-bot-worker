@@ -2,18 +2,31 @@ import os
 import json
 import time
 import uuid
+from typing import Optional
 
 from upstash_redis import Redis
 
 
 # =========================================================
-# REDIS
+# REDIS - Lazy initialization to avoid import-time errors
 # =========================================================
 
-redis = Redis(
-    url=os.environ["UPSTASH_REDIS_REST_URL"],
-    token=os.environ["UPSTASH_REDIS_REST_TOKEN"]
-)
+_redis_client: Optional[Redis] = None
+
+
+def get_redis() -> Redis:
+    """Get Redis client with lazy initialization."""
+    global _redis_client
+    if _redis_client is None:
+        url = os.environ.get("UPSTASH_REDIS_REST_URL")
+        token = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+        if not url or not token:
+            raise RuntimeError(
+                "UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are required. "
+                "Set them in environment variables."
+            )
+        _redis_client = Redis(url=url, token=token)
+    return _redis_client
 
 
 # =========================================================
@@ -62,20 +75,20 @@ def create_group_set(user_id: int, name: str, groups=None):
         "groups": [int(x) for x in (groups or [])],
         "created_at": time.time(),
     }
-    redis.set(group_set_key(set_id), json.dumps(item, ensure_ascii=False))
-    redis.sadd(user_group_sets_key(user_id), set_id)
+    get_redis().set(group_set_key(set_id), json.dumps(item, ensure_ascii=False))
+    get_redis().sadd(user_group_sets_key(user_id), set_id)
     return item
 
 
 def get_group_set(set_id: str):
-    value = redis.get(group_set_key(set_id))
+    value = get_redis().get(group_set_key(set_id))
     if not value:
         return None
     return json.loads(value) if isinstance(value, str) else value
 
 
 def get_user_group_sets(user_id: int):
-    ids = redis.smembers(user_group_sets_key(user_id))
+    ids = get_redis().smembers(user_group_sets_key(user_id))
     if not ids:
         return []
     result = []
@@ -96,7 +109,7 @@ def update_group_set(user_id: int, set_id: str, name: str, groups=None):
     item["name"] = name.strip()
     item["groups"] = [int(x) for x in (groups or [])]
     item["updated_at"] = time.time()
-    redis.set(group_set_key(set_id), json.dumps(item, ensure_ascii=False))
+    get_redis().set(group_set_key(set_id), json.dumps(item, ensure_ascii=False))
     return item
 
 
@@ -106,7 +119,7 @@ def set_group_set_groups(user_id: int, set_id: str, groups):
         return None
     item["groups"] = [int(x) for x in (groups or [])]
     item["updated_at"] = time.time()
-    redis.set(group_set_key(set_id), json.dumps(item, ensure_ascii=False))
+    get_redis().set(group_set_key(set_id), json.dumps(item, ensure_ascii=False))
     return item
 
 
@@ -114,8 +127,8 @@ def delete_group_set(user_id: int, set_id: str):
     item = get_group_set(set_id)
     if not item or int(item.get("user_id", -1)) != int(user_id):
         return False
-    redis.delete(group_set_key(set_id))
-    redis.srem(user_group_sets_key(user_id), set_id)
+    get_redis().delete(group_set_key(set_id))
+    get_redis().srem(user_group_sets_key(user_id), set_id)
     return True
 
 
@@ -133,20 +146,20 @@ def create_template(user_id: int, name: str, message: str, groups=None):
         "groups": [int(x) for x in (groups or [])],
         "created_at": time.time()
     }
-    redis.set(template_key(template_id), json.dumps(template, ensure_ascii=False))
-    redis.sadd(user_templates_key(user_id), template_id)
+    get_redis().set(template_key(template_id), json.dumps(template, ensure_ascii=False))
+    get_redis().sadd(user_templates_key(user_id), template_id)
     return template
 
 
 def get_template(template_id: str):
-    value = redis.get(template_key(template_id))
+    value = get_redis().get(template_key(template_id))
     if not value:
         return None
     return json.loads(value) if isinstance(value, str) else value
 
 
 def get_user_templates(user_id: int):
-    ids = redis.smembers(user_templates_key(user_id))
+    ids = get_redis().smembers(user_templates_key(user_id))
     if not ids:
         return []
     result = []
@@ -167,7 +180,7 @@ def update_template(user_id: int, template_id: str, name: str, message: str):
     template["name"] = name.strip()
     template["message"] = message
     template["updated_at"] = time.time()
-    redis.set(template_key(template_id), json.dumps(template, ensure_ascii=False))
+    get_redis().set(template_key(template_id), json.dumps(template, ensure_ascii=False))
     return template
 
 
@@ -180,7 +193,7 @@ def set_template_groups(user_id: int, template_id: str, groups):
     template["groups"] = [int(x) for x in (groups or [])]
     template["updated_at"] = time.time()
 
-    redis.set(
+    get_redis().set(
         template_key(template_id),
         json.dumps(template, ensure_ascii=False)
     )
@@ -191,8 +204,8 @@ def delete_template(user_id: int, template_id: str):
     template = get_template(template_id)
     if not template or int(template.get("user_id", -1)) != int(user_id):
         return False
-    redis.delete(template_key(template_id))
-    redis.srem(user_templates_key(user_id), template_id)
+    get_redis().delete(template_key(template_id))
+    get_redis().srem(user_templates_key(user_id), template_id)
     return True
 
 
@@ -205,7 +218,7 @@ def save_last_message(
     message: str
 ):
 
-    redis.set(
+    get_redis().set(
         last_message_key(user_id),
         message
     )
@@ -215,7 +228,7 @@ def get_last_message(
     user_id: int
 ):
 
-    return redis.get(
+    return get_redis().get(
         last_message_key(user_id)
     )
 
@@ -273,7 +286,7 @@ def create_task(
 
     save_task(task)
 
-    redis.sadd(
+    get_redis().sadd(
         user_tasks_key(user_id),
         task_id
     )
@@ -287,7 +300,7 @@ def create_task(
 
 def save_task(task: dict):
 
-    redis.set(
+    get_redis().set(
         task_key(task["id"]),
         json.dumps(
             task,
@@ -304,7 +317,7 @@ def get_task(
     task_id: str
 ):
 
-    value = redis.get(
+    value = get_redis().get(
         task_key(task_id)
     )
 
@@ -326,7 +339,7 @@ def get_user_tasks(
     user_id: int
 ):
 
-    ids = redis.smembers(
+    ids = get_redis().smembers(
         user_tasks_key(user_id)
     )
 
@@ -362,7 +375,7 @@ def get_user_tasks(
 
 def get_all_tasks():
 
-    keys = redis.keys(
+    keys = get_redis().keys(
         "broadcast:task:*"
     )
 
@@ -370,7 +383,7 @@ def get_all_tasks():
 
     for key in keys:
 
-        value = redis.get(key)
+        value = get_redis().get(key)
 
         if not value:
             continue
@@ -423,11 +436,11 @@ def delete_task(
     if not task:
         return False
 
-    redis.delete(
+    get_redis().delete(
         task_key(task_id)
     )
 
-    redis.srem(
+    get_redis().srem(
         user_tasks_key(
             task["user_id"]
         ),
@@ -450,7 +463,7 @@ def acquire_task_lock(
         f"broadcast:lock:{task_id}"
     )
 
-    result = redis.set(
+    result = get_redis().set(
         key,
         "1",
         nx=True,
@@ -464,7 +477,7 @@ def release_task_lock(
     task_id: str
 ):
 
-    redis.delete(
+    get_redis().delete(
         f"broadcast:lock:{task_id}"
     )
 
@@ -477,15 +490,15 @@ def user_state_key(user_id: int):
 
 
 def save_user_state(user_id: int, state: dict):
-    redis.set(user_state_key(user_id), json.dumps(state, ensure_ascii=False))
+    get_redis().set(user_state_key(user_id), json.dumps(state, ensure_ascii=False))
 
 
 def get_user_state(user_id: int):
-    value = redis.get(user_state_key(user_id))
+    value = get_redis().get(user_state_key(user_id))
     if not value:
         return None
     return json.loads(value) if isinstance(value, str) else value
 
 
 def delete_user_state(user_id: int):
-    redis.delete(user_state_key(user_id))
+    get_redis().delete(user_state_key(user_id))
