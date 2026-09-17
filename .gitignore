@@ -1,7 +1,5 @@
 ```
-# Dependencies
-.venv/
-venv/
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -10,34 +8,18 @@ __pycache__/
 # Environment
 .env
 .env.local
-*.env.*
+.env.*
+
+# Dependencies
+venv/
+.venv/
+.envrc
 
 # Logs
 *.log
 
-# Build artifacts
-dist/
-build/
-*.egg-info/
-
-# Editors
-.vscode/
-.idea/
+# Temporary files
+*.tmp
 *.swp
-*.swo
-
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Python specific
-*.py[cod]
-*$py.class
-*.so
-.Python
+*~
 ```
