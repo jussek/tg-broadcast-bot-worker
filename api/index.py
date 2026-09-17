@@ -416,16 +416,6 @@ async def text_handler(message: Message):
         existing=get_group_set(st["set_id"]) or {}
         item=update_group_set(uid, st["set_id"], text, existing.get("groups", []))
         clear_state(uid); await message.answer("✅ Объединение переименовано." if item else "❌ Объединение не найдено.", reply_markup=menu()); return
-    if mode == "set_name":
-        if len(text) > 80: await message.answer("❌ Максимум 80 символов."); return
-        chats, err = await load_chats_or_error()
-        if err:
-            clear_state(uid); await message.answer(f"❌ Не удалось получить чаты.\n\n<code>{html.escape(err)}</code>", reply_markup=menu(), parse_mode="HTML"); return
-        st.update({"state":"set_chats", "set_name":text, "chats":chats, "set_chat_ids":[]}); set_state(uid, st)
-        await render_set_picker(message, uid); return
-    if mode == "rename_set":
-        item=update_group_set(uid, st["set_id"], text, get_group_set(st["set_id"]).get("groups", []))
-        clear_state(uid); await message.answer("✅ Объединение переименовано." if item else "❌ Объединение не найдено.", reply_markup=menu()); return
     if mode == "timer_interval":
         try: minutes=int(text); assert minutes>0
         except Exception: await message.answer("❌ Введите положительное число минут."); return
