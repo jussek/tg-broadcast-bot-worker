@@ -1,0 +1,3 @@
+# Vercel builds the `api/` serverless function. Keep its dependencies next to
+# the entry point so the Python runtime installs them while packaging it.
+-r ../requirements.txt
