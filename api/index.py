@@ -1,11 +1,14 @@
 import os
 import asyncio
 import html
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, Update
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -49,16 +52,47 @@ APP_URL = os.environ["APP_URL"].rstrip("/")
 
 QSTASH_SECRET = os.environ.get("QSTASH_SECRET")
 
+# Optional shared secret that Telegram returns in every webhook request.  It is
+# deliberately separate from QSTASH_SECRET because the two services must not
+# be able to impersonate one another.
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+
 
 # =========================================================
 # FASTAPI / TELEGRAM
 # =========================================================
 
-app = FastAPI()
-
-bot = Bot(BOT_TOKEN)
-
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
+
+
+async def configure_webhook():
+    """Register the deployed endpoint every time a serverless instance starts."""
+    options = {
+        "url": f"{APP_URL}/api/webhook",
+        "drop_pending_updates": False,
+    }
+    if TELEGRAM_WEBHOOK_SECRET:
+        options["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+    await bot.set_webhook(**options)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        await configure_webhook()
+    except Exception as error:
+        # Do not make the health endpoint unavailable because Telegram is
+        # temporarily unreachable. The next cold start retries registration.
+        print(f"Webhook setup error: {error}")
+    yield
+    await bot.session.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 qstash = QStash(
     QSTASH_TOKEN
@@ -1882,12 +1916,27 @@ async def webhook(
     request: Request
 ):
 
+    if TELEGRAM_WEBHOOK_SECRET:
+        received = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if received != TELEGRAM_WEBHOOK_SECRET:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "Unauthorized"
+                },
+                status_code=401
+            )
+
     try:
 
         body = await request.json()
 
+        # Attach the bot while parsing. Message.answer() and other shortcut
+        # methods used by handlers require the update objects to be mounted to
+        # the current Bot instance.
         update = Update.model_validate(
-            body
+            body,
+            context={"bot": bot},
         )
 
         await dp.feed_update(
