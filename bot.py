@@ -23,7 +23,6 @@ from redis_storage import (
     get_template,
     get_user_templates,
     update_template,
-    set_template_groups,
     set_template_group_ids,
     delete_template,
     create_chat_group,

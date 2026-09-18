@@ -1,9 +1,22 @@
+import asyncio
+import os
+
+from dotenv import load_dotenv
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 
-# ВАШИ ДАННЫЕ (уже вставлены)
-api_id = 32613699
-api_hash = "6654f4c7713137d6f3f29e6148f9029d"
+load_dotenv()
+
+api_id_raw = os.getenv("API_ID")
+api_hash = os.getenv("API_HASH")
+
+if not api_id_raw or not api_hash:
+    raise SystemExit("Заполни API_ID и API_HASH в файле .env")
+
+try:
+    api_id = int(api_id_raw)
+except ValueError:
+    raise SystemExit("API_ID должен быть числом.")
 
 async def main():
     print("🔄 Подключение к Telegram...")
@@ -26,5 +39,4 @@ async def main():
         except Exception as e:
             print(f"Ошибка при сохранении сессии: {e}")
 
-import asyncio
 asyncio.run(main())
