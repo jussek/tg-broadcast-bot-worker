@@ -37,6 +37,12 @@ class WebhookSecurityTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ok"])
+    def test_vercel_function_path_is_a_protected_webhook_alias(self):
+        with patch.dict(os.environ, {"TELEGRAM_WEBHOOK_SECRET": "expected"}, clear=True):
+            response = TestClient(app).post("/api/index.py", json={})
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["detail"], "Invalid Telegram webhook secret")
 
 
 if __name__ == "__main__":
