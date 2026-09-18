@@ -392,6 +392,8 @@ async def get_chats_endpoint(x_worker_secret: Optional[str] = Header(None)):
     try:
         chats = await worker_get_chats()
         return {"ok": True, "chats": chats}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting chats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -543,10 +545,12 @@ async def worker_get_chats() -> list:
     from worker_client import get_chats as wc_get_chats
     try:
         chats = await wc_get_chats()
-        return chats if isinstance(chats, list) else []
+        if not isinstance(chats, list):
+            raise RuntimeError("Worker returned an invalid chats response")
+        return chats
     except Exception as e:
         logger.error(f"Error getting chats from worker: {e}")
-        return []
+        raise HTTPException(status_code=503, detail="Telegram Worker is unavailable") from e
 
 
 async def worker_send_message(chat_ids: list, message: str) -> dict:
