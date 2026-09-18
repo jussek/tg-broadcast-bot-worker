@@ -25,6 +25,12 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+WORKER_REVISION = (
+    os.getenv("RAILWAY_GIT_COMMIT_SHA")
+    or os.getenv("RENDER_GIT_COMMIT")
+    or os.getenv("SOURCE_VERSION")
+    or "unknown"
+)
 
 
 def utc_now() -> str:
@@ -374,6 +380,14 @@ async def handle_get_chats(request):
         chats = [chat for dialog in dialogs if (chat := serialize_broadcast_dialog(dialog))]
         chats = []
         for dialog in dialogs:
+            try:
+                chat = serialize_broadcast_dialog(dialog)
+                if chat:
+                    chats.append(chat)
+            except Exception:
+                # One malformed or inaccessible dialog must not make the
+                # complete chat list unavailable to the bot.
+                logger.exception("Skipping a dialog that could not be serialized")
             chat = dialog.chat
             is_broadcast = getattr(chat, "broadcast", False)
             is_megagroup = getattr(chat, "megagroup", False)
@@ -413,6 +427,11 @@ def serialize_broadcast_dialog(dialog):
     """Return an API chat record for a broadcast destination, if applicable.
 
     Telethon's public ``Dialog`` API exposes the underlying entity as
+    ``entity``.  ``Dialog.chat`` is not part of that API and is deliberately
+    not accessed here: attempting to read it is the source of the production
+    error this function prevents.
+    """
+    chat = getattr(dialog, "entity", None)
     ``entity``.  Some older versions/examples use ``chat`` instead, so accept
     it as a compatibility fallback without assuming it exists.
     """
@@ -443,6 +462,7 @@ async def handle_health(request):
     return web.json_response({
         "ok": telegram_connected and telegram_authorized and scheduler_running,
         "service": "telegram-worker",
+        "revision": WORKER_REVISION,
         "telegram_connected": telegram_connected,
         "telegram_authorized": telegram_authorized,
         "scheduler_running": scheduler_running,

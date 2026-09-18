@@ -58,6 +58,10 @@ class WorkerStartupTests(unittest.TestCase):
         dialog = SimpleNamespace(entity=SimpleNamespace(), is_group=False, is_channel=False)
         self.assertIsNone(worker.serialize_broadcast_dialog(dialog))
 
+    def test_dialog_without_entity_is_skipped_without_reading_chat(self):
+        dialog = SimpleNamespace(is_group=True, is_channel=True)
+        self.assertIsNone(worker.serialize_broadcast_dialog(dialog))
+
     def test_redis_is_optional_for_a_single_worker(self):
         with patch.object(worker, "redis", None):
             self.assertTrue(worker.acquire_task_lock("task-id"))
