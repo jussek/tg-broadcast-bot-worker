@@ -14,7 +14,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from upstash_redis import Redis
-from qstash import Client as QStashClient
+from qstash import client as QStashClient
 from telethon import TelegramClient
 
 # --- Configuration ---
