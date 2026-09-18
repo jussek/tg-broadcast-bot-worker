@@ -3,3 +3,6 @@ aiogram>=3.4.0
 fastapi>=0.109.0
 supabase>=2.3.0
 upstash-redis>=1.0.0
+# Vercel builds the `api/` serverless function. Keep its dependencies next to
+# the entry point so the Python runtime installs them while packaging it.
+-r ../requirements.txt
