@@ -4,6 +4,7 @@ import base64
 import os
 import struct
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -41,6 +42,22 @@ class UnauthorizedClient:
 
 
 class WorkerStartupTests(unittest.TestCase):
+    def test_dialog_uses_telethon_entity_attribute(self):
+        entity = SimpleNamespace(title="Broadcast group", username=None, megagroup=True, broadcast=False)
+        dialog = SimpleNamespace(entity=entity, is_group=True, is_channel=True)
+
+        with patch.object(worker.utils, "get_peer_id", return_value=-100123):
+            chat = worker.serialize_broadcast_dialog(dialog)
+
+        self.assertEqual(
+            chat,
+            {"id": "-100123", "title": "Broadcast group", "type": "group", "username": None},
+        )
+
+    def test_private_dialog_is_not_a_broadcast_destination(self):
+        dialog = SimpleNamespace(entity=SimpleNamespace(), is_group=False, is_channel=False)
+        self.assertIsNone(worker.serialize_broadcast_dialog(dialog))
+
     def test_redis_is_optional_for_a_single_worker(self):
         with patch.object(worker, "redis", None):
             self.assertTrue(worker.acquire_task_lock("task-id"))

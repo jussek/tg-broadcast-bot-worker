@@ -371,6 +371,7 @@ async def handle_get_chats(request):
     
     try:
         dialogs = await client.get_dialogs()
+        chats = [chat for dialog in dialogs if (chat := serialize_broadcast_dialog(dialog))]
         chats = []
         for dialog in dialogs:
             chat = dialog.chat
@@ -406,6 +407,35 @@ async def handle_get_chats(request):
     except Exception as e:
         logger.error(f"Error getting chats: {e}")
         return web.json_response({"error": str(e), "ok": False, "chats": []}, status=500)
+
+
+def serialize_broadcast_dialog(dialog):
+    """Return an API chat record for a broadcast destination, if applicable.
+
+    Telethon's public ``Dialog`` API exposes the underlying entity as
+    ``entity``.  Some older versions/examples use ``chat`` instead, so accept
+    it as a compatibility fallback without assuming it exists.
+    """
+    chat = getattr(dialog, "entity", None) or getattr(dialog, "chat", None)
+    if chat is None:
+        logger.warning("Skipping dialog without a Telegram entity")
+        return None
+
+    is_broadcast = getattr(chat, "broadcast", False)
+    is_megagroup = getattr(chat, "megagroup", False)
+    is_group = bool(getattr(dialog, "is_group", False) or is_megagroup)
+    is_channel = bool(getattr(dialog, "is_channel", False) or is_broadcast)
+    if not (is_group or is_channel):
+        return None
+
+    return {
+        # ``utils.get_peer_id`` creates Telegram's canonical marked ID (for
+        # example, -100... for channels), preserving the peer type for sends.
+        "id": str(utils.get_peer_id(chat)),
+        "title": getattr(chat, "title", None) or getattr(chat, "username", "Unknown"),
+        "type": "group" if is_group else "channel",
+        "username": getattr(chat, "username", None),
+    }
 
 
 async def handle_health(request):
