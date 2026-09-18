@@ -1,0 +1,8 @@
+services:
+  telegram-worker:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env.worker
+    ports:
+      - "8080:8080"
