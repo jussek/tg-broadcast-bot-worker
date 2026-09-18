@@ -495,6 +495,17 @@ async def telegram_webhook(request: Request):
     return await telegram_webhook_api(request)
 
 
+@app.post("/api/index.py", include_in_schema=False)
+async def vercel_function_webhook(request: Request):
+    """Accept webhook requests made to Vercel's Python function path.
+
+    Vercel rewrites public requests to ``/api/index.py``.  If that function
+    path is used directly (for example by an existing webhook configuration),
+    FastAPI otherwise receives it as the request path and returns 404.
+    """
+    return await telegram_webhook_api(request)
+
+
 @app.post("/set-webhook")
 async def set_webhook_endpoint():
     """Set Telegram webhook URL."""

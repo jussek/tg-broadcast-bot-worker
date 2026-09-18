@@ -8,6 +8,11 @@ from fastapi import HTTPException
 from bot import parse_chat_ids
 from worker_client import get_chats
 from api.index import get_chats_endpoint
+import unittest
+from unittest.mock import AsyncMock, patch
+
+from bot import parse_chat_ids
+from worker_client import get_chats
 
 
 class BotHelperTests(unittest.IsolatedAsyncioTestCase):
