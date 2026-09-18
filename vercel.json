@@ -4,6 +4,16 @@
     {
       "source": "/(.*)",
       "destination": "/api/index.py"
+      "source": "/",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/api/webhook",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/api/process",
+      "destination": "/api/index"
     }
   ]
 }
