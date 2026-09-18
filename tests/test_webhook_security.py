@@ -4,9 +4,10 @@ import unittest
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from api.index import verify_telegram_webhook
+from api.index import app, verify_telegram_webhook
 
 
 def webhook_request(secret: str | None = None) -> Request:
@@ -29,6 +30,13 @@ class WebhookSecurityTests(unittest.TestCase):
     def test_accepts_matching_configured_secret(self):
         with patch.dict(os.environ, {"TELEGRAM_WEBHOOK_SECRET": "expected"}, clear=True):
             verify_telegram_webhook(webhook_request("expected"))
+
+    def test_health_route_is_not_rewritten_to_webhook(self):
+        with patch.dict(os.environ, {"TELEGRAM_WEBHOOK_SECRET": "expected"}, clear=True):
+            response = TestClient(app).get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
 
 
 if __name__ == "__main__":

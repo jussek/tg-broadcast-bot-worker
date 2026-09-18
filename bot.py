@@ -15,8 +15,10 @@ from typing import Optional, Dict, Any
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import State, StatesGroup
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,6 +39,60 @@ else:
     logger.warning("TELEGRAM_BOT_TOKEN not set. Bot will not start.")
 
 
+class TemplateForm(StatesGroup):
+    name = State()
+    message = State()
+
+
+class GroupSetForm(StatesGroup):
+    name = State()
+    groups = State()
+
+
+class BroadcastForm(StatesGroup):
+    message = State()
+    groups = State()
+    interval = State()
+    repeats = State()
+
+
+def api_url(path: str) -> str:
+    """Build a Vercel API URL or fail with a useful configuration error."""
+    if not VERCEL_API_URL:
+        raise RuntimeError("VERCEL_API_URL is not configured")
+    return f"{VERCEL_API_URL.rstrip('/')}{path}"
+
+
+def parse_chat_ids(value: str) -> list[int]:
+    """Parse a comma- or space-separated list of Telegram chat IDs."""
+    try:
+        chat_ids = [int(item) for item in value.replace(",", " ").split()]
+    except ValueError as exc:
+        raise ValueError("Укажите числовые ID чатов через запятую.") from exc
+    if not chat_ids:
+        raise ValueError("Укажите хотя бы один ID чата.")
+    return list(dict.fromkeys(chat_ids))
+
+
+async def fetch_worker_chats() -> list[dict]:
+    """Return chats from the Worker, surfacing configuration failures."""
+    async with aiohttp.ClientSession() as session:
+        headers = {"X-Worker-Secret": os.getenv("WORKER_SECRET", "")}
+        async with session.get(api_url("/chats"), headers=headers) as response:
+            data = await response.json(content_type=None)
+            if response.status != 200 or not data.get("ok", False):
+                raise RuntimeError("Telegram Worker is unavailable")
+            return data.get("chats", [])
+
+
+def format_chats(chats: list[dict]) -> str:
+    """Format a short list of chats to help users choose IDs."""
+    return "\n".join(
+        f"• {chat.get('title', 'Без названия')} — `{chat.get('id')}`"
+        for chat in chats[:20]
+    )
+
+
 async def get_user_from_db(user_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Get or create user via Vercel API."""
     if not VERCEL_API_URL:
@@ -46,7 +102,7 @@ async def get_user_from_db(user_id: int, username: Optional[str] = None, first_n
     try:
         async with aiohttp.ClientSession() as session:
             # Try to get existing user
-            async with session.get(f"{VERCEL_API_URL}/users/{user_id}") as resp:
+            async with session.get(api_url(f"/users/{user_id}")) as resp:
                 if resp.status == 200:
                     return await resp.json()
             
@@ -56,7 +112,7 @@ async def get_user_from_db(user_id: int, username: Optional[str] = None, first_n
                 "username": username,
                 "first_name": first_name
             }
-            async with session.post(f"{VERCEL_API_URL}/users", json=user_data) as resp:
+            async with session.post(api_url("/users"), json=user_data) as resp:
                 if resp.status in (200, 201):
                     return await resp.json()
     except Exception as e:
@@ -98,6 +154,184 @@ if bot and dp:
         welcome_text += "Выберите действие:"
         
         await message.answer(welcome_text, reply_markup=keyboard)
+
+
+    @dp.message(Command("cancel"))
+    async def cmd_cancel(message: types.Message, state: FSMContext):
+        """Cancel an in-progress creation flow."""
+        await state.clear()
+        await message.answer("Действие отменено.")
+
+
+    @dp.message(Command("new_template"))
+    async def cmd_new_template(message: types.Message, state: FSMContext):
+        """Start interactive template creation."""
+        await state.set_state(TemplateForm.name)
+        await message.answer("Введите название шаблона. Для отмены используйте /cancel.")
+
+
+    @dp.message(TemplateForm.name)
+    async def template_name(message: types.Message, state: FSMContext):
+        name = (message.text or "").strip()
+        if not name:
+            await message.answer("Название не должно быть пустым.")
+            return
+        await state.update_data(name=name)
+        await state.set_state(TemplateForm.message)
+        await message.answer("Введите текст сообщения для шаблона.")
+
+
+    @dp.message(TemplateForm.message)
+    async def template_message(message: types.Message, state: FSMContext):
+        text = (message.text or "").strip()
+        if not text:
+            await message.answer("Текст сообщения не должен быть пустым.")
+            return
+        data = await state.get_data()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    api_url(f"/users/{message.from_user.id}/templates"),
+                    json={"name": data["name"], "message": text},
+                ) as response:
+                    if response.status not in (200, 201):
+                        raise RuntimeError(f"API returned {response.status}")
+            await state.clear()
+            await message.answer(f"✅ Шаблон «{data['name']}» создан.")
+        except Exception as exc:
+            logger.error("Error creating template: %s", exc)
+            await message.answer("❌ Не удалось создать шаблон. Проверьте подключение к базе данных.")
+
+
+    @dp.message(Command("new_group_set"))
+    async def cmd_new_group_set(message: types.Message, state: FSMContext):
+        """Start interactive group-set creation."""
+        try:
+            chats = await fetch_worker_chats()
+        except Exception as exc:
+            logger.error("Error getting chats for group set: %s", exc)
+            await message.answer("❌ Worker недоступен. Проверьте TELEGRAM_WORKER_URL и WORKER_SECRET.")
+            return
+        if not chats:
+            await message.answer("Чаты не найдены. Добавьте аккаунт Worker в группы или проверьте его Telegram-сессию.")
+            return
+        await state.update_data(chats=chats)
+        await state.set_state(GroupSetForm.name)
+        await message.answer("Введите название набора групп.")
+
+
+    @dp.message(GroupSetForm.name)
+    async def group_set_name(message: types.Message, state: FSMContext):
+        name = (message.text or "").strip()
+        if not name:
+            await message.answer("Название не должно быть пустым.")
+            return
+        data = await state.get_data()
+        await state.update_data(name=name)
+        await state.set_state(GroupSetForm.groups)
+        await message.answer(
+            "Отправьте ID чатов через запятую:\n" + format_chats(data["chats"])
+        )
+
+
+    @dp.message(GroupSetForm.groups)
+    async def group_set_groups(message: types.Message, state: FSMContext):
+        try:
+            groups = parse_chat_ids(message.text or "")
+            data = await state.get_data()
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    api_url(f"/users/{message.from_user.id}/group-sets"),
+                    json={"name": data["name"], "groups": groups},
+                ) as response:
+                    if response.status not in (200, 201):
+                        raise RuntimeError(f"API returned {response.status}")
+            await state.clear()
+            await message.answer(f"✅ Набор «{data['name']}» создан ({len(groups)} чатов).")
+        except ValueError as exc:
+            await message.answer(f"❌ {exc}")
+        except Exception as exc:
+            logger.error("Error creating group set: %s", exc)
+            await message.answer("❌ Не удалось создать набор групп. Проверьте подключение к базе данных.")
+
+
+    @dp.message(Command("new_broadcast"))
+    async def cmd_new_broadcast(message: types.Message, state: FSMContext):
+        """Start interactive broadcast scheduling."""
+        try:
+            chats = await fetch_worker_chats()
+        except Exception as exc:
+            logger.error("Error getting chats for broadcast: %s", exc)
+            await message.answer("❌ Worker недоступен. Проверьте TELEGRAM_WORKER_URL и WORKER_SECRET.")
+            return
+        if not chats:
+            await message.answer("Чаты не найдены. Добавьте аккаунт Worker в группы или проверьте его Telegram-сессию.")
+            return
+        await state.update_data(chats=chats)
+        await state.set_state(BroadcastForm.message)
+        await message.answer("Введите текст рассылки. Для отмены используйте /cancel.")
+
+
+    @dp.message(BroadcastForm.message)
+    async def broadcast_message(message: types.Message, state: FSMContext):
+        text = (message.text or "").strip()
+        if not text:
+            await message.answer("Текст сообщения не должен быть пустым.")
+            return
+        data = await state.get_data()
+        await state.update_data(message=text)
+        await state.set_state(BroadcastForm.groups)
+        await message.answer("Отправьте ID чатов через запятую:\n" + format_chats(data["chats"]))
+
+
+    @dp.message(BroadcastForm.groups)
+    async def broadcast_groups(message: types.Message, state: FSMContext):
+        try:
+            await state.update_data(groups=parse_chat_ids(message.text or ""))
+            await state.set_state(BroadcastForm.interval)
+            await message.answer("Введите интервал между рассылками в минутах (например, 60).")
+        except ValueError as exc:
+            await message.answer(f"❌ {exc}")
+
+
+    @dp.message(BroadcastForm.interval)
+    async def broadcast_interval(message: types.Message, state: FSMContext):
+        try:
+            interval = int(message.text or "")
+            if interval < 1:
+                raise ValueError
+        except ValueError:
+            await message.answer("Введите целое число не меньше 1.")
+            return
+        await state.update_data(interval_minutes=interval)
+        await state.set_state(BroadcastForm.repeats)
+        await message.answer("Введите количество повторов (например, 1).")
+
+
+    @dp.message(BroadcastForm.repeats)
+    async def broadcast_repeats(message: types.Message, state: FSMContext):
+        try:
+            repeats = int(message.text or "")
+            if repeats < 1:
+                raise ValueError
+            data = await state.get_data()
+            payload = {
+                "message": data["message"], "groups": data["groups"],
+                "interval_minutes": data["interval_minutes"], "repeats": repeats,
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    api_url(f"/users/{message.from_user.id}/broadcast-tasks"), json=payload
+                ) as response:
+                    if response.status not in (200, 201):
+                        raise RuntimeError(f"API returned {response.status}")
+            await state.clear()
+            await message.answer("✅ Рассылка создана и будет выполнена по расписанию.")
+        except ValueError:
+            await message.answer("Введите целое число не меньше 1.")
+        except Exception as exc:
+            logger.error("Error creating broadcast: %s", exc)
+            await message.answer("❌ Не удалось создать рассылку. Проверьте подключение к базе данных.")
     
     
     @dp.callback_query(F.data == "templates")
@@ -241,30 +475,26 @@ if bot and dp:
         await callback.message.answer("🔄 Синхронизация чатов...")
         
         try:
+            chats = await fetch_worker_chats()
+            if not chats:
+                await callback.message.answer(
+                    "⚠️ Worker подключён, но не вернул чатов. Добавьте Telegram-аккаунт Worker в группы "
+                    "и проверьте TELEGRAM_SESSION_STRING."
+                )
+                return
             async with aiohttp.ClientSession() as session:
-                # Get chats from worker via Vercel API
-                headers = {"X-Worker-Secret": os.getenv("WORKER_SECRET", "")}
-                async with session.get(f"{VERCEL_API_URL}/chats", headers=headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        chats = data.get("chats", [])
-                        
-                        # Sync to Supabase via API endpoint
-                        async with session.post(
-                            f"{VERCEL_API_URL}/users/{user_id}/sync-chats",
-                            json={"chats": chats}
-                        ) as sync_resp:
-                            if sync_resp.status in (200, 201):
-                                await callback.message.answer(
-                                    f"✅ Синхронизировано {len(chats)} чатов"
-                                )
-                            else:
-                                await callback.message.answer("❌ Ошибка сохранения чатов")
+                async with session.post(
+                    api_url(f"/users/{user_id}/sync-chats"), json={"chats": chats}
+                ) as sync_response:
+                    if sync_response.status in (200, 201):
+                        await callback.message.answer(f"✅ Синхронизировано {len(chats)} чатов")
                     else:
-                        await callback.message.answer("❌ Ошибка получения чатов от воркера")
+                        await callback.message.answer("❌ Ошибка сохранения чатов")
         except Exception as e:
             logger.error(f"Error syncing chats: {e}")
-            await callback.message.answer(f"❌ Ошибка синхронизации: {e}")
+            await callback.message.answer(
+                "❌ Worker недоступен. Проверьте TELEGRAM_WORKER_URL и WORKER_SECRET."
+            )
         
         await callback.answer()
     

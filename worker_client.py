@@ -72,17 +72,13 @@ async def get_chats():
     Returns:
         List of chat dictionaries.
     """
-    try:
-        data = await _request("GET", "/chats")
-        # Worker может вернуть {"ok": true, "chats": [...]} или просто список
-        if isinstance(data, dict):
-            return data.get("chats", [])
-        elif isinstance(data, list):
-            return data
-        return []
-    except Exception as e:
-        print(f"Error getting chats: {e}")
-        return []
+    data = await _request("GET", "/chats")
+    # Worker может вернуть {"ok": true, "chats": [...]} или просто список
+    if isinstance(data, dict):
+        return data.get("chats", [])
+    if isinstance(data, list):
+        return data
+    raise RuntimeError("Worker returned an invalid chats response")
 
 
 async def send_message(chat_ids: list, message: str):
