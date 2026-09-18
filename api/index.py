@@ -7,6 +7,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, Update
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -60,6 +62,37 @@ TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
 # FASTAPI / TELEGRAM
 # =========================================================
 
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+dp = Dispatcher()
+
+
+async def configure_webhook():
+    """Register the deployed endpoint every time a serverless instance starts."""
+    options = {
+        "url": f"{APP_URL}/api/webhook",
+        "drop_pending_updates": False,
+    }
+    if TELEGRAM_WEBHOOK_SECRET:
+        options["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+    await bot.set_webhook(**options)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        await configure_webhook()
+    except Exception as error:
+        # Do not make the health endpoint unavailable because Telegram is
+        # temporarily unreachable. The next cold start retries registration.
+        print(f"Webhook setup error: {error}")
+    yield
+    await bot.session.close()
+
+
+app = FastAPI(lifespan=lifespan)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
@@ -1926,8 +1959,12 @@ async def webhook(
 
         body = await request.json()
 
+        # Attach the bot while parsing. Message.answer() and other shortcut
+        # methods used by handlers require the update objects to be mounted to
+        # the current Bot instance.
         update = Update.model_validate(
-            body
+            body,
+            context={"bot": bot},
         )
 
         await dp.feed_update(
