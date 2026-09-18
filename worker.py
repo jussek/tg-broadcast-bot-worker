@@ -7,6 +7,7 @@ import uuid
 from aiohttp import web
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon import utils
 from telethon.errors import (
     FloodWaitError,
     ChatWriteForbiddenError,
@@ -53,8 +54,6 @@ required_vars = {
     "TELEGRAM_API_ID": TELEGRAM_API_ID,
     "TELEGRAM_API_HASH": TELEGRAM_API_HASH,
     "TELEGRAM_SESSION_STRING": TELEGRAM_SESSION_STRING,
-    "UPSTASH_REDIS_REST_URL": UPSTASH_REDIS_REST_URL,
-    "UPSTASH_REDIS_REST_TOKEN": UPSTASH_REDIS_REST_TOKEN,
     "WORKER_SECRET": WORKER_SECRET,
     "SUPABASE_URL": SUPABASE_URL,
     "SUPABASE_SERVICE_ROLE_KEY": SUPABASE_SERVICE_ROLE_KEY,
@@ -75,9 +74,14 @@ except ValueError:
     sys.exit(1)
 
 # --- Инициализация клиентов ---
-redis = Redis(
-    url=UPSTASH_REDIS_REST_URL,
-    token=UPSTASH_REDIS_REST_TOKEN,
+if bool(UPSTASH_REDIS_REST_URL) != bool(UPSTASH_REDIS_REST_TOKEN):
+    logger.error("Set both UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN, or neither.")
+    sys.exit(1)
+
+redis = (
+    Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
+    if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN
+    else None
 )
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -96,6 +100,10 @@ scheduler_running = False
 
 def acquire_task_lock(task_id: str, seconds: int = 90) -> bool:
     """Acquire Redis lock for task execution."""
+    if redis is None:
+        # A single persistent worker remains safe without Redis. Deployments
+        # with multiple replicas must configure Redis for distributed locking.
+        return True
     key = f"broadcast:lock:{task_id}"
     try:
         result = redis.set(key, "1", nx=True, ex=seconds)
@@ -107,6 +115,8 @@ def acquire_task_lock(task_id: str, seconds: int = 90) -> bool:
 
 def release_task_lock(task_id: str):
     """Release Redis lock for task."""
+    if redis is None:
+        return
     key = f"broadcast:lock:{task_id}"
     try:
         redis.delete(key)
@@ -313,9 +323,9 @@ async def handle_send(request):
         chat_ids = data.get("chat_ids", [])
         message = data.get("message", "")
         
-        if not chat_ids:
+        if not isinstance(chat_ids, list) or not chat_ids:
             return web.json_response({"error": "chat_ids is required", "ok": False, "success": 0, "failed": 0, "total": 0}, status=400)
-        if not message:
+        if not isinstance(message, str) or not message:
             return web.json_response({"error": "message is required", "ok": False, "success": 0, "failed": 0, "total": 0}, status=400)
         
         if len(message) > 4096:
@@ -326,7 +336,7 @@ async def handle_send(request):
         success_count = 0
         
         for chat_id in unique_chat_ids:
-            result = await send_message_to_chat(str(chat_id), message)
+            result = await send_message_to_chat(chat_id, message)
             if result["success"]:
                 success_count += 1
                 logger.info(f"✅ Message sent to chat {chat_id}")
@@ -366,6 +376,13 @@ async def handle_get_chats(request):
             chat = dialog.chat
             is_broadcast = getattr(chat, "broadcast", False)
             is_megagroup = getattr(chat, "megagroup", False)
+
+            # A broadcast worker must not expose private dialogs as destinations.
+            # ``utils.get_peer_id`` creates Telegram's canonical marked ID
+            # (for example, -100... for channels), preserving the peer type
+            # when the ID is later passed back to Telethon.
+            if not (is_broadcast or is_megagroup):
+                continue
             
             if is_broadcast and not is_megagroup:
                 chat_type = "channel"
@@ -378,7 +395,7 @@ async def handle_get_chats(request):
             username = getattr(chat, "username", None)
             
             chats.append({
-                "id": str(chat.id),
+                "id": str(utils.get_peer_id(chat)),
                 "title": title,
                 "type": chat_type,
                 "username": username,
@@ -394,7 +411,7 @@ async def handle_get_chats(request):
 async def handle_health(request):
     """Health check endpoint with detailed status."""
     return web.json_response({
-        "ok": True,
+        "ok": telegram_connected and telegram_authorized and scheduler_running,
         "service": "telegram-worker",
         "telegram_connected": telegram_connected,
         "telegram_authorized": telegram_authorized,
@@ -407,21 +424,29 @@ async def on_startup(app):
     """Start Telegram client on startup."""
     global telegram_connected, telegram_authorized
     
-    logger.info("🚀 Starting Telegram client...")
-    await client.start()
+    logger.info("🚀 Connecting Telegram client...")
+    # Do not use ``client.start()`` here: when the saved StringSession is
+    # invalid, it tries to run an interactive phone/password login. A hosted
+    # worker has no stdin and then either hangs or fails with EOFError.
+    await client.connect()
     
     telegram_authorized = await client.is_user_authorized()
     if not telegram_authorized:
-        logger.error("❌ SESSION_STRING is invalid or expired!")
-        logger.error("Generate new session via generate_session.py")
-        sys.exit(1)
+        await client.disconnect()
+        raise RuntimeError(
+            "TELEGRAM_SESSION_STRING is invalid or expired. "
+            "Generate a new session with generate_session.py."
+        )
     
     telegram_connected = True
     logger.info("✅ Telegram client connected and authorized!")
     
     try:
-        redis.ping()
-        logger.info("✅ Redis connected!")
+        if redis is None:
+            logger.warning("⚠️ Redis is not configured; task locking is limited to this worker instance.")
+        else:
+            redis.ping()
+            logger.info("✅ Redis connected!")
     except Exception as e:
         logger.warning(f"⚠️ Redis connection error: {e}")
     
