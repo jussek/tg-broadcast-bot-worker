@@ -18,12 +18,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 
-# Импортируем aiogram.types только если он доступен
-try:
-    from aiogram.types import Update
-except ImportError:
-    Update = None
-
+# Import Supabase storage functions (primary data store)
 from storage.supabase_storage import (
     get_or_create_user,
     get_user,
@@ -48,7 +43,6 @@ from storage.supabase_storage import (
     get_user_chats,
     sync_user_chats,
 )
-from worker_client import send_message as worker_send_message, get_chats as worker_get_chats
 
 
 # =========================================================
