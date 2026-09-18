@@ -12,11 +12,12 @@ It handles:
 """
 import os
 import logging
+import hmac
 from typing import Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Header, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Import Supabase storage functions (primary data store)
 from storage.supabase_storage import (
@@ -84,8 +85,8 @@ class UserCreate(BaseModel):
 
 
 class TemplateCreate(BaseModel):
-    name: str
-    message: str
+    name: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=4096)
     groups: Optional[list] = None
 
 
@@ -96,7 +97,7 @@ class TemplateUpdate(BaseModel):
 
 
 class GroupSetCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
     groups: Optional[list] = None
 
 
@@ -106,15 +107,15 @@ class GroupSetUpdate(BaseModel):
 
 
 class BroadcastTaskCreate(BaseModel):
-    message: str
-    groups: list
-    interval_minutes: int
-    repeats: int
+    message: str = Field(min_length=1, max_length=4096)
+    groups: list = Field(min_length=1)
+    interval_minutes: int = Field(ge=1)
+    repeats: int = Field(ge=1)
 
 
 class MessageSend(BaseModel):
-    chat_ids: list
-    message: str
+    chat_ids: list = Field(min_length=1)
+    message: str = Field(min_length=1, max_length=4096)
 
 
 # Telegram Webhook models
@@ -369,7 +370,11 @@ async def send_message_endpoint(message_data: MessageSend, x_worker_secret: Opti
             chat_ids=message_data.chat_ids,
             message=message_data.message
         )
-        return {"ok": True, "result": result}
+        if not result.get("ok", False):
+            raise HTTPException(status_code=502, detail=result.get("error", "Worker rejected the message"))
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error sending message: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -429,6 +434,17 @@ async def sync_user_chats_endpoint(user_id: int, request: Request):
 # TELEGRAM WEBHOOK ENDPOINT (aiogram integration)
 # =========================================================
 
+def verify_telegram_webhook(request: Request) -> None:
+    """Verify Telegram's optional webhook secret token when configured."""
+    expected_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+    if not expected_secret:
+        return
+
+    provided_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(provided_secret, expected_secret):
+        raise HTTPException(status_code=403, detail="Invalid Telegram webhook secret")
+
+
 @app.api_route("/api", methods=["POST"])
 async def telegram_webhook_api(request: Request):
     """Handle Telegram webhook updates via aiogram Dispatcher.
@@ -436,6 +452,7 @@ async def telegram_webhook_api(request: Request):
     This is the main webhook endpoint that Telegram calls.
     It receives updates from Telegram and passes them to the aiogram Dispatcher.
     """
+    verify_telegram_webhook(request)
     try:
         # Import bot and dispatcher lazily to avoid initialization issues
         from bot import get_bot, get_dispatcher
@@ -445,7 +462,7 @@ async def telegram_webhook_api(request: Request):
         
         if not bot_instance or not dispatcher:
             logger.warning("Bot or Dispatcher not initialized (missing TELEGRAM_BOT_TOKEN)")
-            return {"ok": False, "error": "Bot not initialized"}
+            raise HTTPException(status_code=503, detail="Bot not initialized")
         
         # Parse incoming update
         body = await request.json()
@@ -453,16 +470,21 @@ async def telegram_webhook_api(request: Request):
         
         # Convert to aiogram Update object and feed to dispatcher
         from aiogram.types import Update
-        update = Update(**body)
+        update = Update.model_validate(body, context={"bot": bot_instance})
         
         # Process update through dispatcher
         await dispatcher.feed_update(bot_instance, update)
         
         return {"ok": True}
         
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logger.warning(f"Invalid Telegram webhook update: {e}")
+        raise HTTPException(status_code=400, detail="Invalid Telegram update") from e
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
-        return {"ok": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail="Webhook processing failed") from e
 
 
 @app.api_route("/telegram-webhook", methods=["POST"])
@@ -484,10 +506,11 @@ async def set_webhook_endpoint():
     if not webhook_url:
         raise HTTPException(status_code=400, detail="VERCEL_API_URL not set")
     
-    webhook_url = f"{webhook_url}/telegram-webhook"
+    webhook_url = f"{webhook_url.rstrip('/')}/telegram-webhook"
+    webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
     
     try:
-        await bot_instance.set_webhook(webhook_url)
+        await bot_instance.set_webhook(webhook_url, secret_token=webhook_secret)
         return {"ok": True, "webhook_url": webhook_url}
     except Exception as e:
         logger.error(f"Error setting webhook: {e}")

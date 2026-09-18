@@ -2,7 +2,7 @@ import os
 import sys
 import logging
 import asyncio
-import time
+from datetime import datetime, timedelta, timezone
 import uuid
 from aiohttp import web
 from telethon import TelegramClient
@@ -25,6 +25,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def utc_now() -> str:
+    """Return a PostgreSQL-compatible UTC timestamp."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def utc_after_minutes(minutes: int) -> str:
+    """Return a PostgreSQL-compatible UTC timestamp offset by minutes."""
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+
+
 # --- Получение переменных окружения ---
 TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
@@ -45,6 +56,8 @@ required_vars = {
     "UPSTASH_REDIS_REST_URL": UPSTASH_REDIS_REST_URL,
     "UPSTASH_REDIS_REST_TOKEN": UPSTASH_REDIS_REST_TOKEN,
     "WORKER_SECRET": WORKER_SECRET,
+    "SUPABASE_URL": SUPABASE_URL,
+    "SUPABASE_SERVICE_ROLE_KEY": SUPABASE_SERVICE_ROLE_KEY,
 }
 
 missing_vars = [key for key, value in required_vars.items() if not value]
@@ -104,7 +117,7 @@ def release_task_lock(task_id: str):
 def get_due_broadcast_tasks():
     """Get active tasks that are due for execution from Supabase."""
     try:
-        now = time.time()
+        now = utc_now()
         response = supabase.table("broadcast_tasks")\
             .select("*")\
             .eq("status", "active")\
@@ -119,7 +132,7 @@ def get_due_broadcast_tasks():
 def update_broadcast_task(task_id: str, **kwargs):
     """Update broadcast task in Supabase."""
     try:
-        kwargs["updated_at"] = time.time()
+        kwargs["updated_at"] = utc_now()
         response = supabase.table("broadcast_tasks")\
             .update(kwargs)\
             .eq("id", task_id)\
@@ -144,7 +157,7 @@ def log_broadcast(task_id: str, user_id: int, message: str, groups: list,
             "success_count": success_count,
             "failed_count": failed_count,
             "errors": errors,
-            "created_at": time.time(),
+            "created_at": utc_now(),
         }
         supabase.table("broadcast_logs").insert(log_entry).execute()
         return log_entry
@@ -242,7 +255,7 @@ async def execute_broadcast_task(task):
         else:
             # Schedule next run
             new_status = "active"
-            next_run = time.time() + (interval_minutes * 60)
+            next_run = utc_after_minutes(interval_minutes)
             logger.info(f"⏰ Task {task_id} scheduled for next run at {next_run}")
         
         update_broadcast_task(

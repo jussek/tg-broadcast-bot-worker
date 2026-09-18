@@ -8,6 +8,8 @@ For local/standalone deployment: use polling mode.
 """
 import os
 import logging
+import asyncio
+import sys
 from typing import Optional, Dict, Any
 
 import aiohttp
@@ -282,12 +284,12 @@ if bot and dp:
             await bot.session.close()
     
     
-    def setup_bot():
-        """Setup bot handlers and return dispatcher."""
-        if dp:
-            dp.startup.register(on_startup)
-            dp.shutdown.register(on_shutdown)
-        return dp
+def setup_bot() -> Optional[Dispatcher]:
+    """Register lifecycle handlers and return the dispatcher."""
+    if dp:
+        dp.startup.register(on_startup)
+        dp.shutdown.register(on_shutdown)
+    return dp
 
 
 def get_bot() -> Optional[Bot]:
@@ -298,3 +300,21 @@ def get_bot() -> Optional[Bot]:
 def get_dispatcher() -> Optional[Dispatcher]:
     """Get dispatcher instance."""
     return dp
+
+
+async def run_polling() -> None:
+    """Run the bot locally when webhook mode is not used."""
+    dispatcher = setup_bot()
+    if not bot or not dispatcher:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is required to start the bot")
+    await dispatcher.start_polling(bot)
+
+
+if __name__ == "__main__":
+    if not USE_POLLING:
+        logger.error("Set BOT_USE_POLLING=true to run bot.py locally; use webhook mode on Vercel.")
+        sys.exit(1)
+    try:
+        asyncio.run(run_polling())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Telegram bot stopped")

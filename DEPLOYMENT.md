@@ -150,6 +150,7 @@ curl https://your-worker-url.onrender.com/health
 | `SUPABASE_URL` | URL из шага 1 |
 | `SUPABASE_SERVICE_ROLE_KEY` | Ключ из шага 1 |
 | `TELEGRAM_BOT_TOKEN` | Токен бота из шага 3.3 |
+| `TELEGRAM_WEBHOOK_SECRET` | Случайная строка для проверки запросов Telegram к webhook |
 | `VERCEL_API_URL` | URL вашего Vercel приложения (например: `https://your-app.vercel.app`) |
 
 ⚠️ **НЕ ДОБАВЛЯЙТЕ** `TELEGRAM_SESSION_STRING` в Vercel!
