@@ -60,9 +60,17 @@ async def _request(method: str, path: str, **kwargs):
     headers["X-Worker-Secret"] = _get_worker_secret()
     async with aiohttp.ClientSession(timeout=_get_timeout()) as session:
         async with session.request(method, f"{_get_worker_url()}{path}", headers=headers, **kwargs) as response:
-            data = await response.json(content_type=None)
+            try:
+                data = await response.json(content_type=None)
+            except (aiohttp.ContentTypeError, ValueError) as exc:
+                body = (await response.text()).strip().replace("\n", " ")[:300]
+                raise RuntimeError(
+                    f"Worker returned a non-JSON HTTP {response.status} response: {body or '<empty>'}"
+                ) from exc
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Worker returned an invalid HTTP {response.status} response")
             if response.status >= 400 or not data.get("ok", False):
-                raise RuntimeError(data.get("error", f"Worker HTTP {response.status}"))
+                raise RuntimeError(data.get("error") or f"Worker HTTP {response.status}")
             return data
 
 

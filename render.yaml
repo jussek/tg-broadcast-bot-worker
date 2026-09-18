@@ -2,6 +2,9 @@ services:
   - type: web
     name: telegram-broadcast-worker
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    # Fail the build before deployment if a merge introduced invalid Python.
+    # This prevents Render from replacing a healthy Worker with a process that
+    # immediately exits on a SyntaxError.
+    buildCommand: pip install -r requirements.txt && python -m py_compile worker.py
     startCommand: python worker.py
     healthCheckPath: /health
