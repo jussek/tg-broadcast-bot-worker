@@ -75,14 +75,36 @@ def parse_chat_ids(value: str) -> list[int]:
 
 
 async def fetch_worker_chats() -> list[dict]:
-    """Return chats from the Worker, surfacing configuration failures."""
+    """Return chats from the API proxy, then directly from the Worker if needed."""
+    headers = {"X-Worker-Secret": os.getenv("WORKER_SECRET", "")}
+    proxy_error: Exception | None = None
     async with aiohttp.ClientSession() as session:
-        headers = {"X-Worker-Secret": os.getenv("WORKER_SECRET", "")}
-        async with session.get(api_url("/chats"), headers=headers) as response:
-            data = await response.json(content_type=None)
-            if response.status != 200 or not data.get("ok", False):
-                raise RuntimeError("Telegram Worker is unavailable")
-            return data.get("chats", [])
+        try:
+            async with session.get(api_url("/chats"), headers=headers) as response:
+                data = await response.json(content_type=None)
+                if response.status == 200 and data.get("ok", False):
+                    return data.get("chats", [])
+                proxy_error = RuntimeError(
+                    data.get("detail") or data.get("error") or f"API returned {response.status}"
+                )
+        except Exception as exc:
+            proxy_error = exc
+
+        worker_url = os.getenv("TELEGRAM_WORKER_URL", "").rstrip("/")
+        if worker_url:
+            try:
+                async with session.get(f"{worker_url}/chats", headers=headers) as response:
+                    data = await response.json(content_type=None)
+                    if response.status == 200 and data.get("ok", False):
+                        logger.warning("Using direct Worker fallback after API proxy failure: %s", proxy_error)
+                        return data.get("chats", [])
+                    raise RuntimeError(data.get("error") or f"Worker returned {response.status}")
+            except Exception as direct_error:
+                raise RuntimeError(
+                    f"Worker is unavailable through both API and direct URL: {direct_error}"
+                ) from direct_error
+
+    raise RuntimeError(f"Telegram Worker is unavailable: {proxy_error}")
 
 
 def format_chats(chats: list[dict]) -> str:
