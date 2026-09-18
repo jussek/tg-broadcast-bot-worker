@@ -410,91 +410,104 @@ async def get_user_logs_endpoint(user_id: int, limit: int = 50):
 
 
 # =========================================================
-# TELEGRAM WEBHOOK ENDPOINT (for aiogram bot webhook)
+# TELEGRAM WEBHOOK ENDPOINT (Direct handling)
 # =========================================================
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
-    """Handle Telegram webhook updates for aiogram bot.
+    """Handle Telegram webhook updates directly.
     
-    This endpoint processes incoming messages and callback queries from Telegram
-    when the bot is configured to use webhook mode instead of polling.
+    This endpoint processes incoming messages and callback queries from Telegram.
+    It handles the /start command and basic interaction without requiring
+    a full aiogram dispatcher in this module.
     """
-    # Проверяем, что Update доступен
-    if Update is None:
-        logger.warning("aiogram.types.Update not available")
-        return {"ok": False, "error": "Bot module not available"}
-    
-    # Import bot here to avoid circular imports if bot module is not available
-    try:
-        from bot import get_bot, get_dispatcher
-        bot_instance = get_bot()
-        dp_instance = get_dispatcher()
-    except Exception as e:
-        logger.warning(f"Could not import bot module: {e}")
-        return {"ok": False, "error": "Bot not available"}
-    
-    if not bot_instance or not dp_instance:
-        logger.warning("Bot not initialized - TELEGRAM_BOT_TOKEN missing")
-        return {"ok": False, "error": "Bot not initialized"}
-    
     try:
         body = await request.json()
-        update = Update.model_validate(body)
+        logger.info(f"Received webhook update: {body.get('update_id')}")
         
-        # Process the update through dispatcher
-        await dp_instance.feed_update(bot_instance, update)
+        # Extract message data
+        message = body.get('message', {})
+        callback_query = body.get('callback_query', {})
+        
+        if message:
+            chat_id = message.get('chat', {}).get('id')
+            text = message.get('text', '')
+            user = message.get('from', {})
+            user_id = user.get('id', chat_id)
+            username = user.get('username')
+            first_name = user.get('first_name')
+            
+            # Handle /start command
+            if text == '/start':
+                # Create or get user
+                try:
+                    from storage.supabase_storage import get_or_create_user
+                    get_or_create_user(user_id=user_id, username=username, first_name=first_name)
+                    logger.info(f"User {user_id} registered via /start")
+                except Exception as e:
+                    logger.error(f"Error registering user: {e}")
+                
+                # Send response via Worker
+                try:
+                    from worker_client import send_message as worker_send_message
+                    response_text = (
+                        "👋 Добро пожаловать в Telegram Broadcast Bot!\n\n"
+                        "Я помогу вам настроить рассылку сообщений по группам.\n\n"
+                        "Команды:\n"
+                        "/chats - Получить список ваших чатов\n"
+                        "/templates - Управление шаблонами\n"
+                        "/groups - Управление группами\n"
+                        "/broadcast - Создать рассылку\n"
+                        "/logs - История рассылок"
+                    )
+                    await worker_send_message(chat_ids=[str(chat_id)], message=response_text)
+                except Exception as e:
+                    logger.error(f"Error sending response: {e}")
+            
+            elif text == '/chats':
+                try:
+                    from worker_client import get_chats as worker_get_chats
+                    chats_data = await worker_get_chats()
+                    chats = chats_data.get('chats', [])
+                    if chats:
+                        response_text = f"📋 Ваши чаты ({len(chats)}):\n\n"
+                        for i, chat in enumerate(chats[:20], 1):
+                            title = chat.get('title', 'Unknown')
+                            chat_type = chat.get('type', 'unknown')
+                            chat_id_val = chat.get('id', 'N/A')
+                            response_text += f"{i}. {title} ({chat_type}) - ID: {chat_id_val}\n"
+                        if len(chats) > 20:
+                            response_text += f"... и ещё {len(chats) - 20} чатов"
+                    else:
+                        response_text = "У вас пока нет доступных чатов."
+                    
+                    from worker_client import send_message as worker_send_message
+                    await worker_send_message(chat_ids=[str(chat_id)], message=response_text)
+                except Exception as e:
+                    logger.error(f"Error getting chats: {e}")
+                    from worker_client import send_message as worker_send_message
+                    await worker_send_message(chat_ids=[str(chat_id)], message="Ошибка получения чатов.")
+            
+            else:
+                # Echo or default response
+                try:
+                    from worker_client import send_message as worker_send_message
+                    await worker_send_message(
+                        chat_ids=[str(chat_id)], 
+                        message=f"Получено сообщение: {text}\nИспользуйте /start для просмотра команд."
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending echo: {e}")
+        
+        elif callback_query:
+            # Handle callback queries (inline buttons)
+            cb_data = callback_query.get('data', '')
+            chat_id = callback_query.get('message', {}).get('chat', {}).get('id')
+            logger.info(f"Callback query: {cb_data}")
+            # Add handling for inline buttons here if needed
         
         return {"ok": True}
         
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
         return {"ok": False, "error": str(e)}
-
-
-@app.post("/set-webhook")
-async def set_webhook_endpoint(webhook_url: str = None):
-    """Set Telegram webhook URL."""
-    try:
-        from bot import get_bot
-        bot_instance = get_bot()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Bot not available: {e}")
-    
-    if not bot_instance:
-        raise HTTPException(status_code=400, detail="Bot not initialized")
-    
-    # Get Vercel URL from environment or use provided/default
-    vercel_url = os.getenv("VERCEL_URL") or os.getenv("VERCEL_API_URL")
-    if not webhook_url:
-        if vercel_url:
-            webhook_url = f"https://{vercel_url}/telegram-webhook"
-        else:
-            raise HTTPException(status_code=400, detail="VERCEL_URL not set and no webhook_url provided")
-    
-    try:
-        await bot_instance.set_webhook(webhook_url)
-        return {"ok": True, "webhook_url": webhook_url}
-    except Exception as e:
-        logger.error(f"Error setting webhook: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/delete-webhook")
-async def delete_webhook_endpoint():
-    """Delete Telegram webhook."""
-    try:
-        from bot import get_bot
-        bot_instance = get_bot()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Bot not available: {e}")
-    
-    if not bot_instance:
-        raise HTTPException(status_code=400, detail="Bot not initialized")
-    
-    try:
-        await bot_instance.delete_webhook()
-        return {"ok": True}
-    except Exception as e:
-        logger.error(f"Error deleting webhook: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
