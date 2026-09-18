@@ -8,13 +8,12 @@ For local/standalone deployment: use polling mode.
 """
 import os
 import logging
-from typing import Optional
-from contextlib import asynccontextmanager
+from typing import Optional, Dict, Any
 
 import aiohttp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
 
 logging.basicConfig(level=logging.INFO)
@@ -22,21 +21,23 @@ logger = logging.getLogger(__name__)
 
 # Environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-VERCEL_API_URL = os.getenv("VERCEL_API_URL", "https://your-vercel-app.vercel.app")
+VERCEL_API_URL = os.getenv("VERCEL_API_URL")
 USE_POLLING = os.getenv("BOT_USE_POLLING", "false").lower() == "true"
 
-if not TELEGRAM_BOT_TOKEN:
-    logger.warning("TELEGRAM_BOT_TOKEN not set. Bot will not start.")
-    bot = None
-    dp = None
-else:
+# Initialize bot and dispatcher only if token is provided
+bot: Optional[Bot] = None
+dp: Optional[Dispatcher] = None
+
+if TELEGRAM_BOT_TOKEN:
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
+else:
+    logger.warning("TELEGRAM_BOT_TOKEN not set. Bot will not start.")
 
 
-async def get_user_from_db(user_id: int, username: Optional[str] = None, first_name: Optional[str] = None):
+async def get_user_from_db(user_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Get or create user via Vercel API."""
-    if not VERCEL_API_URL or VERCEL_API_URL.startswith("https://your-"):
+    if not VERCEL_API_URL:
         logger.warning("VERCEL_API_URL not configured")
         return None
         
@@ -246,7 +247,7 @@ if bot and dp:
                         data = await resp.json()
                         chats = data.get("chats", [])
                         
-                        # Sync to Supabase
+                        # Sync to Supabase via API endpoint
                         async with session.post(
                             f"{VERCEL_API_URL}/users/{user_id}/sync-chats",
                             json={"chats": chats}
@@ -283,24 +284,17 @@ if bot and dp:
     
     def setup_bot():
         """Setup bot handlers and return dispatcher."""
-        dp.startup.register(on_startup)
-        dp.shutdown.register(on_shutdown)
+        if dp:
+            dp.startup.register(on_startup)
+            dp.shutdown.register(on_shutdown)
         return dp
 
 
-def setup_bot():
-    """Setup bot handlers and return dispatcher (no-op if bot not initialized)."""
-    if dp:
-        dp.startup.register(on_startup)
-        dp.shutdown.register(on_shutdown)
-    return dp
-
-
-def get_bot():
+def get_bot() -> Optional[Bot]:
     """Get bot instance."""
     return bot
 
 
-def get_dispatcher():
+def get_dispatcher() -> Optional[Dispatcher]:
     """Get dispatcher instance."""
     return dp
