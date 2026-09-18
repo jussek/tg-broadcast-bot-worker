@@ -18,12 +18,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 
-# Импортируем aiogram.types только если он доступен
-try:
-    from aiogram.types import Update
-except ImportError:
-    Update = None
-
 from storage.supabase_storage import (
     get_or_create_user,
     get_user,
