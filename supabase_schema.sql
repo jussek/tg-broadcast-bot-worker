@@ -104,6 +104,23 @@ CREATE INDEX IF NOT EXISTS idx_chat_memberships_user_id ON public.chat_membershi
 CREATE INDEX IF NOT EXISTS idx_chat_memberships_chat_title ON public.chat_memberships(chat_title);
 
 -- =========================================================
+-- BOT FSM STATE (aiogram webhook conversations)
+-- =========================================================
+CREATE TABLE IF NOT EXISTS public.bot_fsm_states (
+    bot_id BIGINT NOT NULL,
+    chat_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    thread_id BIGINT NOT NULL DEFAULT 0,
+    destiny TEXT NOT NULL DEFAULT 'default',
+    state TEXT,
+    data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (bot_id, chat_id, user_id, thread_id, destiny)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_fsm_states_updated_at ON public.bot_fsm_states(updated_at);
+
+-- =========================================================
 -- ROW LEVEL SECURITY (RLS)
 -- =========================================================
 -- Enable RLS on all tables
@@ -113,6 +130,7 @@ ALTER TABLE public.group_sets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.broadcast_tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.broadcast_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.chat_memberships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.bot_fsm_states ENABLE ROW LEVEL SECURITY;
 
 -- Drop existing policies if they exist (to allow re-running)
 DROP POLICY IF EXISTS "Users can view their own data" ON public.users;
@@ -139,6 +157,8 @@ DROP POLICY IF EXISTS "Service role full access broadcast_logs" ON public.broadc
 DROP POLICY IF EXISTS "Users can view their own chats" ON public.chat_memberships;
 DROP POLICY IF EXISTS "Service can manage chats" ON public.chat_memberships;
 DROP POLICY IF EXISTS "Service role full access chat_memberships" ON public.chat_memberships;
+
+DROP POLICY IF EXISTS "Service role full access bot_fsm_states" ON public.bot_fsm_states;
 
 -- Policies for users table
 -- Service role has full access
@@ -259,6 +279,10 @@ CREATE POLICY "Users can view their own chats" ON public.chat_memberships
 
 CREATE POLICY "Service can manage chats" ON public.chat_memberships
     FOR ALL USING (true);
+
+-- FSM state is an internal implementation detail of the webhook bot.
+CREATE POLICY "Service role full access bot_fsm_states" ON public.bot_fsm_states
+    FOR ALL USING (auth.jwt()->>'role' = 'service_role');
 
 -- =========================================================
 -- HELPER FUNCTIONS
