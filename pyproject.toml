@@ -13,5 +13,8 @@ dependencies = [
     "uvicorn[standard]>=0.27.0",
 ]
 
+[tool.vercel]
+entrypoint = "api.index:app"
+
 [tool.uv]
 dev-dependencies = []

@@ -31,6 +31,12 @@ class WebhookSecurityTests(unittest.TestCase):
         with patch.dict(os.environ, {"TELEGRAM_WEBHOOK_SECRET": "expected"}, clear=True):
             verify_telegram_webhook(webhook_request("expected"))
 
+    def test_health_route_is_not_rewritten_to_webhook(self):
+        with patch.dict(os.environ, {"TELEGRAM_WEBHOOK_SECRET": "expected"}, clear=True):
+            response = TestClient(app).get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ok"])
     def test_vercel_function_path_is_a_protected_webhook_alias(self):
         with patch.dict(os.environ, {"TELEGRAM_WEBHOOK_SECRET": "expected"}, clear=True):
             response = TestClient(app).post("/api/index.py", json={})
