@@ -1,6 +1,7 @@
 import os
 import asyncio
 import html
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -59,11 +60,34 @@ TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
 # FASTAPI / TELEGRAM
 # =========================================================
 
-app = FastAPI()
-
 bot = Bot(BOT_TOKEN)
-
 dp = Dispatcher()
+
+
+async def configure_webhook():
+    """Register the deployed endpoint every time a serverless instance starts."""
+    options = {
+        "url": f"{APP_URL}/api/webhook",
+        "drop_pending_updates": False,
+    }
+    if TELEGRAM_WEBHOOK_SECRET:
+        options["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+    await bot.set_webhook(**options)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        await configure_webhook()
+    except Exception as error:
+        # Do not make the health endpoint unavailable because Telegram is
+        # temporarily unreachable. The next cold start retries registration.
+        print(f"Webhook setup error: {error}")
+    yield
+    await bot.session.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 qstash = QStash(
     QSTASH_TOKEN

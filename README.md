@@ -83,6 +83,10 @@ APP_URL=https://имя-проекта.vercel.app
 ```
 
 `APP_URL` должен быть публичным HTTPS-адресом именно production-деплоя, без
+слеша в конце. При старте serverless-функции приложение само регистрирует этот
+webhook. После первого деплоя открой `https://имя-проекта.vercel.app/`, чтобы
+гарантированно запустить функцию. Если Telegram был временно недоступен или
+webhook нужно перерегистрировать вручную, выполни:
 слеша в конце. После деплоя обязательно зарегистрируй webhook — без этого
 Telegram не будет пересылать обновления боту:
 
@@ -98,6 +102,9 @@ curl -X POST "https://api.telegram.org/bot$BOT_TOKEN/setWebhook" \
 curl "https://api.telegram.org/bot$BOT_TOKEN/getWebhookInfo"
 ```
 
+Vercel направляет все URL в FastAPI-приложение через правило из `vercel.json`.
+Без него Vercel ищет отдельные serverless-файлы для этих URL и webhook/QStash
+не доходят до обработчиков.
 Vercel направляет `/api/webhook` и `/api/process` в FastAPI-приложение через
 правила из `vercel.json`. Без этих правил Vercel ищет отдельные serverless
 файлы для этих URL и webhook/QStash не доходят до обработчиков.
