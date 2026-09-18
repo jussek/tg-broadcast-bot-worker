@@ -377,6 +377,7 @@ async def handle_get_chats(request):
     
     try:
         dialogs = await client.get_dialogs()
+        chats = [chat for dialog in dialogs if (chat := serialize_broadcast_dialog(dialog))]
         chats = []
         for dialog in dialogs:
             try:
@@ -387,6 +388,33 @@ async def handle_get_chats(request):
                 # One malformed or inaccessible dialog must not make the
                 # complete chat list unavailable to the bot.
                 logger.exception("Skipping a dialog that could not be serialized")
+            chat = dialog.chat
+            is_broadcast = getattr(chat, "broadcast", False)
+            is_megagroup = getattr(chat, "megagroup", False)
+
+            # A broadcast worker must not expose private dialogs as destinations.
+            # ``utils.get_peer_id`` creates Telegram's canonical marked ID
+            # (for example, -100... for channels), preserving the peer type
+            # when the ID is later passed back to Telethon.
+            if not (is_broadcast or is_megagroup):
+                continue
+            
+            if is_broadcast and not is_megagroup:
+                chat_type = "channel"
+            elif is_megagroup:
+                chat_type = "group"
+            else:
+                chat_type = "private"
+            
+            title = getattr(chat, "title", None) or getattr(chat, "username", "Unknown")
+            username = getattr(chat, "username", None)
+            
+            chats.append({
+                "id": str(utils.get_peer_id(chat)),
+                "title": title,
+                "type": chat_type,
+                "username": username,
+            })
         
         logger.info(f"Got {len(chats)} chats")
         return web.json_response({"ok": True, "chats": chats})
@@ -404,6 +432,10 @@ def serialize_broadcast_dialog(dialog):
     error this function prevents.
     """
     chat = getattr(dialog, "entity", None)
+    ``entity``.  Some older versions/examples use ``chat`` instead, so accept
+    it as a compatibility fallback without assuming it exists.
+    """
+    chat = getattr(dialog, "entity", None) or getattr(dialog, "chat", None)
     if chat is None:
         logger.warning("Skipping dialog without a Telegram entity")
         return None
