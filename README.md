@@ -60,8 +60,8 @@ python generate_session.py
 - `TELEGRAM_API_ID` — числовой ID приложения
 - `TELEGRAM_API_HASH` — хэш приложения
 - `TELEGRAM_SESSION_STRING` — строка сессии (только здесь!)
-- `UPSTASH_REDIS_REST_URL` — URL Redis
-- `UPSTASH_REDIS_REST_TOKEN` — токен Redis
+- `UPSTASH_REDIS_REST_URL` — URL Redis (опционально для одного экземпляра Worker; обязателен для нескольких реплик)
+- `UPSTASH_REDIS_REST_TOKEN` — токен Redis (задаётся вместе с URL)
 - `WORKER_SECRET` — случайный секрет для авторизации запросов
 - `SUPABASE_URL` — URL проекта Supabase
 - `SUPABASE_SERVICE_ROLE_KEY` — сервисный ключ
