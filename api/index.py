@@ -49,6 +49,11 @@ APP_URL = os.environ["APP_URL"].rstrip("/")
 
 QSTASH_SECRET = os.environ.get("QSTASH_SECRET")
 
+# Optional shared secret that Telegram returns in every webhook request.  It is
+# deliberately separate from QSTASH_SECRET because the two services must not
+# be able to impersonate one another.
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+
 
 # =========================================================
 # FASTAPI / TELEGRAM
@@ -1881,6 +1886,17 @@ async def process(
 async def webhook(
     request: Request
 ):
+
+    if TELEGRAM_WEBHOOK_SECRET:
+        received = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if received != TELEGRAM_WEBHOOK_SECRET:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "Unauthorized"
+                },
+                status_code=401
+            )
 
     try:
 
