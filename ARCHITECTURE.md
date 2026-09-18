@@ -77,7 +77,7 @@
 
 ### Vercel (API/Bot):
 ```bash
-TELEGRAM_BOT_TOKEN=8897529259:AAEpmvr3aTyTjf_J66_xqBBEROlwxP_40vM
+TELEGRAM_BOT_TOKEN=<token-from-BotFather>
 VERCEL_API_URL=https://tg-broadcast-bot-worker.vercel.app
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=eyJhbG...
