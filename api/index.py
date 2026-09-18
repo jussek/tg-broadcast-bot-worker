@@ -429,12 +429,12 @@ async def sync_user_chats_endpoint(user_id: int, request: Request):
 # TELEGRAM WEBHOOK ENDPOINT (aiogram integration)
 # =========================================================
 
-@app.post("/telegram-webhook")
-async def telegram_webhook(request: Request):
+@app.api_route("/api", methods=["POST"])
+async def telegram_webhook_api(request: Request):
     """Handle Telegram webhook updates via aiogram Dispatcher.
     
-    This endpoint receives updates from Telegram and passes them
-    to the aiogram Dispatcher for processing by registered handlers.
+    This is the main webhook endpoint that Telegram calls.
+    It receives updates from Telegram and passes them to the aiogram Dispatcher.
     """
     try:
         # Import bot and dispatcher lazily to avoid initialization issues
@@ -463,6 +463,12 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
         return {"ok": False, "error": str(e)}
+
+
+@app.api_route("/telegram-webhook", methods=["POST"])
+async def telegram_webhook(request: Request):
+    """Alternative webhook endpoint path."""
+    return await telegram_webhook_api(request)
 
 
 @app.post("/set-webhook")

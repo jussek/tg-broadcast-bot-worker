@@ -1,1 +1,28 @@
-Nothing needs to be added to the .gitignore file based on the provided changes, as they only include source code files (.py) and a documentation file (.md).
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment
+.venv/
+venv/
+.env
+.env.local
+*.env.*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+
+# Editors
+.vscode/
+.idea/
+
+# Build artifacts
+dist/
+build/
+target/
+```

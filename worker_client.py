@@ -67,9 +67,22 @@ async def _request(method: str, path: str, **kwargs):
 
 
 async def get_chats():
-    """Get chats from worker."""
-    data = await _request("GET", "/chats")
-    return data.get("chats", [])
+    """Get chats from worker.
+    
+    Returns:
+        List of chat dictionaries.
+    """
+    try:
+        data = await _request("GET", "/chats")
+        # Worker может вернуть {"ok": true, "chats": [...]} или просто список
+        if isinstance(data, dict):
+            return data.get("chats", [])
+        elif isinstance(data, list):
+            return data
+        return []
+    except Exception as e:
+        print(f"Error getting chats: {e}")
+        return []
 
 
 async def send_message(chat_ids: list, message: str):
