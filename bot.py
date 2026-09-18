@@ -17,8 +17,9 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
+
+from storage.aiogram_supabase_storage import SupabaseFSMStorage
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,7 +35,9 @@ dp: Optional[Dispatcher] = None
 
 if TELEGRAM_BOT_TOKEN:
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
+    # MemoryStorage loses multi-step forms whenever a serverless instance is
+    # recycled. Supabase keeps the FSM state between webhook invocations.
+    dp = Dispatcher(storage=SupabaseFSMStorage())
 else:
     logger.warning("TELEGRAM_BOT_TOKEN not set. Bot will not start.")
 
@@ -75,14 +78,36 @@ def parse_chat_ids(value: str) -> list[int]:
 
 
 async def fetch_worker_chats() -> list[dict]:
-    """Return chats from the Worker, surfacing configuration failures."""
+    """Return chats from the API proxy, then directly from the Worker if needed."""
+    headers = {"X-Worker-Secret": os.getenv("WORKER_SECRET", "")}
+    proxy_error: Exception | None = None
     async with aiohttp.ClientSession() as session:
-        headers = {"X-Worker-Secret": os.getenv("WORKER_SECRET", "")}
-        async with session.get(api_url("/chats"), headers=headers) as response:
-            data = await response.json(content_type=None)
-            if response.status != 200 or not data.get("ok", False):
-                raise RuntimeError("Telegram Worker is unavailable")
-            return data.get("chats", [])
+        try:
+            async with session.get(api_url("/chats"), headers=headers) as response:
+                data = await response.json(content_type=None)
+                if response.status == 200 and data.get("ok", False):
+                    return data.get("chats", [])
+                proxy_error = RuntimeError(
+                    data.get("detail") or data.get("error") or f"API returned {response.status}"
+                )
+        except Exception as exc:
+            proxy_error = exc
+
+        worker_url = os.getenv("TELEGRAM_WORKER_URL", "").rstrip("/")
+        if worker_url:
+            try:
+                async with session.get(f"{worker_url}/chats", headers=headers) as response:
+                    data = await response.json(content_type=None)
+                    if response.status == 200 and data.get("ok", False):
+                        logger.warning("Using direct Worker fallback after API proxy failure: %s", proxy_error)
+                        return data.get("chats", [])
+                    raise RuntimeError(data.get("error") or f"Worker returned {response.status}")
+            except Exception as direct_error:
+                raise RuntimeError(
+                    f"Worker is unavailable through both API and direct URL: {direct_error}"
+                ) from direct_error
+
+    raise RuntimeError(f"Telegram Worker is unavailable: {proxy_error}")
 
 
 def format_chats(chats: list[dict]) -> str:
