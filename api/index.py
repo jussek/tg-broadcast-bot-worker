@@ -16,7 +16,7 @@ from typing import Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Header, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Import Supabase storage functions (primary data store)
 from storage.supabase_storage import (
@@ -84,8 +84,8 @@ class UserCreate(BaseModel):
 
 
 class TemplateCreate(BaseModel):
-    name: str
-    message: str
+    name: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=4096)
     groups: Optional[list] = None
 
 
@@ -96,7 +96,7 @@ class TemplateUpdate(BaseModel):
 
 
 class GroupSetCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
     groups: Optional[list] = None
 
 
@@ -106,15 +106,15 @@ class GroupSetUpdate(BaseModel):
 
 
 class BroadcastTaskCreate(BaseModel):
-    message: str
-    groups: list
-    interval_minutes: int
-    repeats: int
+    message: str = Field(min_length=1, max_length=4096)
+    groups: list = Field(min_length=1)
+    interval_minutes: int = Field(ge=1)
+    repeats: int = Field(ge=1)
 
 
 class MessageSend(BaseModel):
-    chat_ids: list
-    message: str
+    chat_ids: list = Field(min_length=1)
+    message: str = Field(min_length=1, max_length=4096)
 
 
 # Telegram Webhook models
@@ -369,7 +369,11 @@ async def send_message_endpoint(message_data: MessageSend, x_worker_secret: Opti
             chat_ids=message_data.chat_ids,
             message=message_data.message
         )
-        return {"ok": True, "result": result}
+        if not result.get("ok", False):
+            raise HTTPException(status_code=502, detail=result.get("error", "Worker rejected the message"))
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error sending message: {e}")
         raise HTTPException(status_code=500, detail=str(e))

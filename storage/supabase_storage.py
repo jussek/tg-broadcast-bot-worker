@@ -4,11 +4,21 @@ This module provides persistent storage for users, templates, group sets,
 broadcast tasks, and delivery logs using Supabase PostgreSQL.
 """
 import os
-import time
+from datetime import datetime, timedelta, timezone
 import uuid
 from typing import Optional
 
 from supabase import create_client, Client
+
+
+def utc_now() -> str:
+    """Return a PostgreSQL-compatible UTC timestamp."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def utc_after_minutes(minutes: int) -> str:
+    """Return a PostgreSQL-compatible UTC timestamp offset by minutes."""
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
 
 
 # =========================================================
@@ -55,7 +65,7 @@ def get_or_create_user(user_id: int, username: Optional[str] = None, first_name:
         "user_id": user_id,
         "username": username,
         "first_name": first_name,
-        "created_at": time.time(),
+        "created_at": utc_now(),
         "is_active": True,
     }
     response = db.table("users").insert(user_data).execute()
@@ -91,8 +101,8 @@ def create_template(user_id: int, name: str, message: str, groups: Optional[list
         "name": name.strip(),
         "message": message,
         "groups": groups or [],
-        "created_at": time.time(),
-        "updated_at": time.time(),
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
     }
     db.table("templates").insert(template).execute()
     return template
@@ -115,7 +125,7 @@ def get_user_templates(user_id: int) -> list[dict]:
 def update_template(user_id: int, template_id: str, name: Optional[str] = None, message: Optional[str] = None, groups: Optional[list] = None) -> Optional[dict]:
     """Update template fields."""
     db = get_supabase_client()
-    updates = {"updated_at": time.time()}
+    updates = {"updated_at": utc_now()}
     if name is not None:
         updates["name"] = name.strip()
     if message is not None:
@@ -148,8 +158,8 @@ def create_group_set(user_id: int, name: str, groups: Optional[list] = None) -> 
         "user_id": user_id,
         "name": name.strip(),
         "groups": [int(x) for x in (groups or [])],
-        "created_at": time.time(),
-        "updated_at": time.time(),
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
     }
     db.table("group_sets").insert(group_set).execute()
     return group_set
@@ -172,7 +182,7 @@ def get_user_group_sets(user_id: int) -> list[dict]:
 def update_group_set(user_id: int, set_id: str, name: Optional[str] = None, groups: Optional[list] = None) -> Optional[dict]:
     """Update group set fields."""
     db = get_supabase_client()
-    updates = {"updated_at": time.time()}
+    updates = {"updated_at": utc_now()}
     if name is not None:
         updates["name"] = name.strip()
     if groups is not None:
@@ -198,7 +208,7 @@ def create_broadcast_task(user_id: int, message: str, groups: list, interval_min
     """Create a new scheduled broadcast task."""
     db = get_supabase_client()
     task_id = str(uuid.uuid4())
-    now = time.time()
+    now = utc_now()
     task = {
         "id": task_id,
         "user_id": user_id,
@@ -208,7 +218,7 @@ def create_broadcast_task(user_id: int, message: str, groups: list, interval_min
         "total_repeats": int(repeats),
         "completed_repeats": 0,
         "status": "active",
-        "next_run": now + int(interval_minutes) * 60,
+        "next_run": utc_after_minutes(int(interval_minutes)),
         "created_at": now,
         "updated_at": now,
     }
@@ -236,7 +246,7 @@ def get_user_broadcast_tasks(user_id: int, status: Optional[str] = None) -> list
 def get_due_broadcast_tasks() -> list[dict]:
     """Get all active tasks that are due for execution."""
     db = get_supabase_client()
-    now = time.time()
+    now = utc_now()
     response = db.table("broadcast_tasks").select("*").eq("status", "active").lte("next_run", now).execute()
     return response.data or []
 
@@ -244,7 +254,7 @@ def get_due_broadcast_tasks() -> list[dict]:
 def update_broadcast_task(task_id: str, **kwargs) -> Optional[dict]:
     """Update task fields."""
     db = get_supabase_client()
-    kwargs["updated_at"] = time.time()
+    kwargs["updated_at"] = utc_now()
     response = db.table("broadcast_tasks").update(kwargs).eq("id", task_id).execute()
     return response.data[0] if response.data else None
 
@@ -274,7 +284,7 @@ def log_broadcast(task_id: Optional[str], user_id: int, message: str, groups: li
         "success_count": success_count,
         "failed_count": failed_count,
         "errors": errors or [],
-        "created_at": time.time(),
+        "created_at": utc_now(),
     }
     db.table("broadcast_logs").insert(log_entry).execute()
     return log_entry
@@ -307,7 +317,7 @@ def upsert_chat_membership(user_id: int, chat_id: int, chat_title: str, chat_typ
         "chat_id": chat_id,
         "chat_title": chat_title,
         "chat_type": chat_type,
-        "last_seen": time.time(),
+        "last_seen": utc_now(),
     }
     response = db.table("chat_memberships").upsert(membership, on_conflict="user_id,chat_id").execute()
     return response.data[0] if response.data else membership
