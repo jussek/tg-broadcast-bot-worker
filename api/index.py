@@ -392,6 +392,8 @@ async def get_chats_endpoint(x_worker_secret: Optional[str] = Header(None)):
     try:
         chats = await worker_get_chats()
         return {"ok": True, "chats": chats}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting chats: {e}")
         raise HTTPException(status_code=500, detail=str(e))

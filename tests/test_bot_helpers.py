@@ -1,4 +1,13 @@
 """Tests for bot input parsing and Worker failure handling."""
+import os
+import unittest
+from unittest.mock import AsyncMock, patch
+
+from fastapi import HTTPException
+
+from bot import parse_chat_ids
+from worker_client import get_chats
+from api.index import get_chats_endpoint
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -19,6 +28,14 @@ class BotHelperTests(unittest.IsolatedAsyncioTestCase):
         with patch("worker_client._request", new=AsyncMock(side_effect=RuntimeError("offline"))):
             with self.assertRaisesRegex(RuntimeError, "offline"):
                 await get_chats()
+
+    async def test_chats_endpoint_preserves_worker_unavailable_status(self):
+        unavailable = HTTPException(status_code=503, detail="Telegram Worker is unavailable")
+        with patch("api.index.worker_get_chats", new=AsyncMock(side_effect=unavailable)):
+            with self.assertRaises(HTTPException) as raised:
+                await get_chats_endpoint(x_worker_secret=os.getenv("WORKER_SECRET"))
+
+        self.assertEqual(raised.exception.status_code, 503)
 
 
 if __name__ == "__main__":
