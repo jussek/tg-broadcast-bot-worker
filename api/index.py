@@ -17,7 +17,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
-from aiogram.types import Update
+
+# Импортируем aiogram.types только если он доступен
+try:
+    from aiogram.types import Update
+except ImportError:
+    Update = None
 
 from storage.supabase_storage import (
     get_or_create_user,
@@ -415,6 +420,11 @@ async def telegram_webhook(request: Request):
     This endpoint processes incoming messages and callback queries from Telegram
     when the bot is configured to use webhook mode instead of polling.
     """
+    # Проверяем, что Update доступен
+    if Update is None:
+        logger.warning("aiogram.types.Update not available")
+        return {"ok": False, "error": "Bot module not available"}
+    
     # Import bot here to avoid circular imports if bot module is not available
     try:
         from bot import get_bot, get_dispatcher
@@ -430,7 +440,7 @@ async def telegram_webhook(request: Request):
     
     try:
         body = await request.json()
-        update = types.Update.model_validate(body)
+        update = Update.model_validate(body)
         
         # Process the update through dispatcher
         await dp_instance.feed_update(bot_instance, update)
