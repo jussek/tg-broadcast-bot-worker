@@ -60,8 +60,8 @@ python generate_session.py
 - `TELEGRAM_API_ID` — числовой ID приложения
 - `TELEGRAM_API_HASH` — хэш приложения
 - `TELEGRAM_SESSION_STRING` — строка сессии (только здесь!)
-- `UPSTASH_REDIS_REST_URL` — URL Redis
-- `UPSTASH_REDIS_REST_TOKEN` — токен Redis
+- `UPSTASH_REDIS_REST_URL` — URL Redis (опционально для одного экземпляра Worker; обязателен для нескольких реплик)
+- `UPSTASH_REDIS_REST_TOKEN` — токен Redis (задаётся вместе с URL)
 - `WORKER_SECRET` — случайный секрет для авторизации запросов
 - `SUPABASE_URL` — URL проекта Supabase
 - `SUPABASE_SERVICE_ROLE_KEY` — сервисный ключ
@@ -79,6 +79,31 @@ Worker запустит:
 - Scheduler для периодических задач
 
 **Health check:** `GET /health`
+
+### 4.1 Рекомендуемый Worker без Render: Docker на VPS
+
+Worker хранит постоянную Telegram MTProto-сессию, поэтому его надёжнее
+запускать как один постоянно работающий контейнер на VPS, а не как
+serverless-функцию. В репозиторий добавлены `Dockerfile` и
+`docker-compose.yml` с фиксированным Python 3.12.
+
+```bash
+# На сервере: склонируйте репозиторий и создайте конфигурацию Worker.
+cp .env.worker.example .env.worker
+# Заполните TELEGRAM_*, SUPABASE_*, WORKER_SECRET и при необходимости Redis.
+
+# Соберите и запустите один экземпляр Worker.
+docker compose up -d --build
+docker compose logs -f telegram-worker
+
+# Проверка с самого сервера.
+curl http://127.0.0.1:8080/health
+```
+
+Для доступа Vercel к Worker настройте HTTPS reverse proxy (например, Nginx
+или Caddy) перед портом `8080`, затем задайте публичный URL в
+`TELEGRAM_WORKER_URL` на Vercel. Не запускайте больше одной реплики с одной
+`TELEGRAM_SESSION_STRING`; для нескольких реплик обязательно нужен Redis.
 
 ### 5. Vercel API
 
