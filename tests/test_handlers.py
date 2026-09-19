@@ -20,6 +20,16 @@ class FakeMessage:
         self.answers.append((text, reply_markup))
 
 
+class FakeCallback:
+    def __init__(self, data):
+        self.data = data
+        self.from_user = SimpleNamespace(id=42)
+        self.answers = []
+
+    async def answer(self, text=None, **kwargs):
+        self.answers.append((text, kwargs))
+
+
 def test_start_sends_menu_when_redis_is_unavailable(monkeypatch):
     """The start command must still respond instead of failing before answer()."""
     monkeypatch.setattr(index, "clear_user_state", lambda _user_id: (_ for _ in ()).throw(RuntimeError("Redis unavailable")))
@@ -44,6 +54,12 @@ def test_task_lock_accepts_upstash_success_response(monkeypatch):
 def test_group_keyboard_uses_telethon_dialog_name():
     keyboard = index.groups_selection_keyboard([], [SimpleNamespace(id=-100, name="Новости")])
     assert keyboard.inline_keyboard[0][0].text == "☐ Новости"
+
+
+def test_main_menu_does_not_include_settings():
+    keyboard = index.main_menu_keyboard()
+    callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+    assert "settings" not in callbacks
 
 
 def test_parse_positive_integer_rejects_invalid_values():
@@ -92,3 +108,44 @@ def test_timer_setup_accepts_custom_interval_and_repeat_count(monkeypatch):
     })]
     assert "через 7 мин." in repeat_message.answers[-1][0]
     assert "3 раз" in repeat_message.answers[-1][0]
+
+
+def test_group_list_name_is_saved_from_waiting_state(monkeypatch):
+    state = {
+        "step": "waiting_for_group_list_name",
+        "selected_groups": ["-1001", "-1002"],
+    }
+    saved_lists = []
+    cleared_users = []
+
+    monkeypatch.setattr(index, "get_user_state", lambda _user_id: state)
+    monkeypatch.setattr(index, "get_group_lists", lambda _user_id: [])
+    monkeypatch.setattr(index, "save_group_lists", lambda user_id, lists: saved_lists.append((user_id, lists)))
+    monkeypatch.setattr(index, "clear_user_state", lambda user_id: cleared_users.append(user_id))
+
+    message = FakeMessage("Основные каналы")
+    asyncio.run(index.handle_message(message))
+
+    assert saved_lists[0][0] == 42
+    assert saved_lists[0][1][0]["name"] == "Основные каналы"
+    assert saved_lists[0][1][0]["groups"] == ["-1001", "-1002"]
+    assert cleared_users == [42]
+    assert message.answers[-1][0] == "✅ Список «Основные каналы» сохранён."
+
+
+def test_active_timer_can_be_cancelled(monkeypatch):
+    task = {"task_id": "task-1", "user_id": 42, "status": "active"}
+    saved_tasks = []
+    callback = FakeCallback("cancel_task:task-1")
+
+    monkeypatch.setattr(index, "get_task", lambda _task_id: task)
+    monkeypatch.setattr(index, "save_task", lambda task_id, data: saved_tasks.append((task_id, data.copy())))
+
+    async def fake_tasks_handler(_callback):
+        return None
+
+    monkeypatch.setattr(index, "cb_tasks", fake_tasks_handler)
+    asyncio.run(index.cb_cancel_task(callback))
+
+    assert saved_tasks == [("task-1", {"task_id": "task-1", "user_id": 42, "status": "cancelled"})]
+    assert callback.answers[0][0] == "Таймер отменён."
