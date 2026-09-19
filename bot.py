@@ -5,14 +5,14 @@ import os
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-
 from redis_storage import (
+    SET_STATE_FIELDS,
     save_last_message,
     get_last_message,
     create_task,
@@ -23,7 +23,6 @@ from redis_storage import (
     get_template,
     get_user_templates,
     update_template,
-    set_template_groups,
     set_template_group_ids,
     delete_template,
     create_chat_group,
@@ -32,54 +31,111 @@ from redis_storage import (
     update_chat_group,
     set_chat_group_chats,
     delete_chat_group,
+    get_user_state,
+    set_user_state,
+    clear_user_state,
 )
+from telegram_sender import create_client, list_group_dialogs, send_to_groups
 
-
-# ============================================================
-# CONFIG
-# ============================================================
 
 load_dotenv()
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не найден в .env")
-
-if not SESSION_STRING:
-    raise RuntimeError(
-        "TELEGRAM_SESSION_STRING не найден в .env"
+dp = Dispatcher()
+bot = (
+    Bot(
+        BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-
-
-# ============================================================
-# TELETHON USER ACCOUNT
-# ============================================================
-
-user_client = TelegramClient(
-    StringSession(SESSION_STRING),
-    API_ID,
-    API_HASH
+    if BOT_TOKEN
+    else None
 )
 
 
-# ============================================================
-# AIROGRAM BOT
-# ============================================================
+class _PersistSet(set):
+    def __init__(self, items, on_change):
+        super().__init__(items or [])
+        self._on_change = on_change
 
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
+    def add(self, element):
+        super().add(element)
+        self._on_change()
+
+    def discard(self, element):
+        super().discard(element)
+        self._on_change()
+
+    def remove(self, element):
+        super().remove(element)
+        self._on_change()
+
+    def clear(self):
+        super().clear()
+        self._on_change()
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        self._on_change()
 
 
-# ============================================================
-# TEMPORARY USER STATES
-# ============================================================
+class TrackedState(dict):
+    def __init__(self, user_id, data):
+        self._user_id = user_id
+        self._ready = False
+        super().__init__()
+        for key, value in (data or {}).items():
+            super().__setitem__(key, self._wrap(key, value))
+        self._ready = True
 
-user_states = {}
+    def _persist(self):
+        if self._ready:
+            set_user_state(self._user_id, self._dump())
+
+    def _dump(self):
+        dumped = {}
+        for key, value in self.items():
+            dumped[key] = set(value) if isinstance(value, _PersistSet) else value
+        return dumped
+
+    def _wrap(self, key, value):
+        if key in SET_STATE_FIELDS or isinstance(value, set):
+            return _PersistSet(value or [], self._persist)
+        return value
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, self._wrap(key, value))
+        self._persist()
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+
+class UserStates:
+    def get(self, user_id, default=None):
+        data = get_user_state(user_id)
+        if data is None:
+            return default
+        return TrackedState(user_id, data)
+
+    def pop(self, user_id, default=None):
+        data = get_user_state(user_id)
+        clear_user_state(user_id)
+        return data if data is not None else default
+
+    def __getitem__(self, user_id):
+        data = get_user_state(user_id)
+        if data is None:
+            raise KeyError(user_id)
+        return TrackedState(user_id, data)
+
+    def __setitem__(self, user_id, value):
+        set_user_state(user_id, value)
+
+
+user_states = UserStates()
 
 
 # ============================================================
@@ -115,7 +171,8 @@ async def start(message: Message):
     await message.answer(
         "🤖 <b>Панель управления</b>\n\n"
         "Выберите необходимое действие:",
-        reply_markup=main_keyboard()
+        reply_markup=main_keyboard(),
+        parse_mode="HTML",
     )
 
 
@@ -679,14 +736,7 @@ async def handle_user_message(message: Message):
 # ============================================================
 
 async def load_chat_dialogs():
-    if not user_client.is_connected():
-        await user_client.connect()
-
-    result = []
-    async for dialog in user_client.iter_dialogs():
-        if dialog.is_group:
-            result.append(dialog)
-    return result
+    return await list_group_dialogs()
 
 
 async def load_groups(message_or_callback, user_id):
@@ -866,15 +916,17 @@ async def open_chat_group(callback: CallbackQuery):
 
 
 async def load_chat_picker(message_or_callback, user_id):
-    chats = await load_chat_dialogs()
     state = user_states[user_id]
-    state["chat_picker"] = chats
+    chats = state.get("chat_picker")
+    if not chats:
+        chats = await load_chat_dialogs()
+        state["chat_picker"] = chats
     selected_ids = {int(x) for x in state.get("chat_picker_selected_ids", set())}
     state["chat_picker_selected_ids"] = selected_ids
     builder = InlineKeyboardBuilder()
     for i, dialog in enumerate(chats):
-        prefix = "☑️" if int(dialog.id) in selected_ids else "☐"
-        name = dialog.name
+        prefix = "☑️" if int(dialog["id"]) in selected_ids else "☐"
+        name = dialog["name"]
         if len(name) > 42:
             name = name[:39] + "..."
         builder.button(text=f"{prefix} {name}", callback_data=f"chat_picker_toggle:{i}")
@@ -941,7 +993,7 @@ async def chat_picker_toggle(callback: CallbackQuery):
     i = int(callback.data.split(":", 1)[1])
     dialog = state["chat_picker"][i]
     selected = state["chat_picker_selected_ids"]
-    cid = int(dialog.id)
+    cid = int(dialog["id"])
     if cid in selected:
         selected.remove(cid)
     else:
@@ -961,7 +1013,7 @@ async def chat_picker_all(callback: CallbackQuery):
     if len(selected) == len(chats):
         selected.clear()
     else:
-        selected.update(int(x.id) for x in chats)
+        selected.update(int(x["id"]) for x in chats)
     await load_chat_picker(callback, callback.from_user.id)
     await callback.answer()
 
@@ -1007,7 +1059,7 @@ async def continue_groups(callback: CallbackQuery):
         chat_ids.update(int(x) for x in group.get("chat_ids", []))
 
     dialogs = await load_chat_dialogs()
-    selected_dialogs = [d for d in dialogs if int(d.id) in chat_ids]
+    selected_dialogs = [d for d in dialogs if int(d["id"]) in chat_ids]
     if not selected_dialogs:
         await callback.answer("В выбранных группах не найдено доступных чатов.", show_alert=True)
         return
@@ -1049,7 +1101,7 @@ async def continue_groups(callback: CallbackQuery):
         await callback.answer("Шаблон сохранён с группами.")
         return
 
-    state["groups"] = selected_dialogs
+    state["groups"] = [int(d["id"]) for d in selected_dialogs]
     state["selected"] = set(range(len(selected_dialogs)))
     state["selected_group_ids"] = selected_group_ids
     state["state"] = "settings"
@@ -1118,46 +1170,31 @@ async def send_now(
 
     text = state["message"]
 
-
     await callback.message.edit_text(
         "📨 <b>Начинаю рассылку...</b>\n\n"
         f"Групп: <b>{len(groups)}</b>\n"
         "Задержка между отправками: <b>1 сек.</b>"
     )
 
+    client = None
+    try:
+        client = await create_client()
+        result = await send_to_groups(client, text, groups)
+        success = result["success"]
+        failed = result["failed"]
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ <b>Ошибка рассылки:</b> {html.escape(str(e))}",
+            reply_markup=main_keyboard(),
+        )
+        user_states.pop(user_id, None)
+        await callback.answer()
+        return
+    finally:
+        if client:
+            await client.disconnect()
 
-    success = 0
-    failed = 0
-
-
-    for group in groups:
-
-        try:
-
-            await user_client.send_message(
-                group.entity,
-                text
-            )
-
-            success += 1
-
-            print(
-                f"Отправлено: {group.name}"
-            )
-
-        except Exception as e:
-
-            failed += 1
-
-            print(
-                f"Ошибка {group.name}: {e}"
-            )
-
-
-        # 1 секунда перед следующей отправкой
-
-        await asyncio.sleep(1)
-
+    save_last_message(user_id, text)
 
     await callback.message.edit_text(
         "✅ <b>Рассылка завершена</b>\n\n"
@@ -1165,7 +1202,6 @@ async def send_now(
         f"Ошибок: <b>{failed}</b>",
         reply_markup=main_keyboard()
     )
-
 
     user_states.pop(
         user_id,
@@ -1248,11 +1284,7 @@ async def start_timer(
         )
     ]
 
-
-    group_ids = [
-        group.id
-        for group in groups
-    ]
+    group_ids = [int(group_id) for group_id in groups]
 
 
     task = create_task(
@@ -1441,7 +1473,7 @@ async def stop_task(
         return
 
 
-    if task["user_id"] != user_id:
+    if int(task.get("user_id", -1)) != int(user_id):
 
         await callback.answer(
             "Нет доступа.",
