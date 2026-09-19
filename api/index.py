@@ -6,12 +6,13 @@ from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import JSONResponse
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.types import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.filters import Command
 
 from upstash_redis import Redis
 from qstash import QStash
@@ -169,31 +170,31 @@ def send_decision_keyboard():
 
 # --- Handlers ---
 
-@dp.message_handler(commands=["start", "s"])
+@dp.message(Command("start", "s"))
 async def cmd_start(message: types.Message):
     await clear_user_state(message.from_user.id)
     text = "🤖 Панель рассылки\n\nВыбери действие:"
     await message.answer(text, reply_markup=main_menu_keyboard())
 
-@dp.callback_query_handler(lambda c: c.data == "back_menu")
+@dp.callback_query(lambda c: c.data == "back_menu")
 async def cb_back_menu(callback: types.CallbackQuery):
     await clear_user_state(callback.from_user.id)
     text = "🤖 Панель рассылки\n\nВыбери действие:"
     await callback.message.edit_text(text, reply_markup=main_menu_keyboard())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "new_broadcast")
+@dp.callback_query(lambda c: c.data == "new_broadcast")
 async def cb_new_broadcast(callback: types.CallbackQuery):
     await callback.message.edit_text("📋 Выбор действия для новой рассылки:", reply_markup=broadcast_action_keyboard())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "write_message")
+@dp.callback_query(lambda c: c.data == "write_message")
 async def cb_write_message(callback: types.CallbackQuery):
     await set_user_state(callback.from_user.id, {"step": "waiting_for_message"})
     await callback.message.edit_text("📝 Введите текст сообщения для рассылки:", reply_markup=cancel_keyboard())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "use_last_message")
+@dp.callback_query(lambda c: c.data == "use_last_message")
 async def cb_use_last_message(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     last_msg = get_last_message(user_id)
@@ -205,7 +206,7 @@ async def cb_use_last_message(callback: types.CallbackQuery):
     await fetch_and_show_groups(callback, user_id)
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "select_template")
+@dp.callback_query(lambda c: c.data == "select_template")
 async def cb_select_template(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     templates = get_user_templates(user_id)
@@ -223,7 +224,7 @@ async def cb_select_template(callback: types.CallbackQuery):
     await callback.message.edit_text("📚 Выберите шаблон:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("use_template:"))
+@dp.callback_query(lambda c: c.data.startswith("use_template:"))
 async def cb_use_template(callback: types.CallbackQuery):
     template_id = callback.data.split(":")[1]
     user_id = callback.from_user.id
@@ -261,7 +262,7 @@ async def fetch_and_show_groups(callback: types.CallbackQuery, user_id: int):
         logger.error(f"Error fetching groups: {e}")
         await callback.answer("Ошибка получения групп.", show_alert=True)
 
-@dp.callback_query_handler(lambda c: c.data.startswith("toggle_group:"))
+@dp.callback_query(lambda c: c.data.startswith("toggle_group:"))
 async def cb_toggle_group(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     gid = callback.data.split(":")[1]
@@ -286,7 +287,7 @@ async def cb_toggle_group(callback: types.CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=kb)
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "select_all_groups")
+@dp.callback_query(lambda c: c.data == "select_all_groups")
 async def cb_select_all_groups(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     group_data_json = redis.get(f"broadcast:groups:{user_id}")
@@ -302,7 +303,7 @@ async def cb_select_all_groups(callback: types.CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=kb)
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "continue_to_send")
+@dp.callback_query(lambda c: c.data == "continue_to_send")
 async def cb_continue_to_send(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     state = get_user_state(user_id)
@@ -313,7 +314,7 @@ async def cb_continue_to_send(callback: types.CallbackQuery):
     await callback.message.edit_text("Как отправить сообщение?", reply_markup=send_decision_keyboard())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "send_now")
+@dp.callback_query(lambda c: c.data == "send_now")
 async def cb_send_now(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     state = get_user_state(user_id)
@@ -355,7 +356,7 @@ async def cb_send_now(callback: types.CallbackQuery):
     
     await callback.message.edit_text(f"✅ Рассылка завершена\n\n📨 Успешно: {success_count}\n❌ Ошибок: {error_count}", reply_markup=main_menu_keyboard())
 
-@dp.callback_query_handler(lambda c: c.data == "schedule_task")
+@dp.callback_query(lambda c: c.data == "schedule_task")
 async def cb_schedule_task(callback: types.CallbackQuery):
     # Simplified: Schedule for 1 minute later for demo
     user_id = callback.from_user.id
@@ -398,38 +399,38 @@ async def cb_schedule_task(callback: types.CallbackQuery):
     
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "cancel")
+@dp.callback_query(lambda c: c.data == "cancel")
 async def cb_cancel(callback: types.CallbackQuery):
     await clear_user_state(callback.from_user.id)
     await callback.message.edit_text("Отменено.", reply_markup=main_menu_keyboard())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "templates")
+@dp.callback_query(lambda c: c.data == "templates")
 async def cb_templates(callback: types.CallbackQuery):
     await callback.message.edit_text("Функционал шаблонов в разработке (демо).", reply_markup=main_menu_keyboard())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "tasks")
+@dp.callback_query(lambda c: c.data == "tasks")
 async def cb_tasks(callback: types.CallbackQuery):
     await callback.message.edit_text("Функционал таймеров в разработке (демо).", reply_markup=main_menu_keyboard())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "groups")
+@dp.callback_query(lambda c: c.data == "groups")
 async def cb_groups(callback: types.CallbackQuery):
     await callback.message.edit_text("Список ваших групп доступен при создании рассылки.", reply_markup=main_menu_keyboard())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "settings")
+@dp.callback_query(lambda c: c.data == "settings")
 async def cb_settings(callback: types.CallbackQuery):
     await callback.message.edit_text("Настройки в разработке.", reply_markup=main_menu_keyboard())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "back_broadcast")
+@dp.callback_query(lambda c: c.data == "back_broadcast")
 async def cb_back_broadcast(callback: types.CallbackQuery):
     await callback.message.edit_text("📋 Выбор действия для новой рассылки:", reply_markup=broadcast_action_keyboard())
     await callback.answer()
 
-@dp.message_handler()
+@dp.message()
 async def handle_message(message: types.Message):
     user_id = message.from_user.id
     state = get_user_state(user_id)

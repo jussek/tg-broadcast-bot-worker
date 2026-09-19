@@ -3,7 +3,7 @@ import sys
 import os
 
 # Mock environment variables for import testing
-os.environ["BOT_TOKEN"] = "test"
+os.environ["BOT_TOKEN"] = "8897529259:AAEpmvr3aTyTjf_J66_xqBBEROlwxP_40vM"
 os.environ["API_ID"] = "123"
 os.environ["API_HASH"] = "test"
 os.environ["TELEGRAM_SESSION_STRING"] = "test"
