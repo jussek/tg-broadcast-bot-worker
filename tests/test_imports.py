@@ -1,6 +1,8 @@
 """Test all imports and basic structure."""
 import sys
-sys.path.insert(0, '/workspace')
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 def test_api_index():
     """Test FastAPI app import."""

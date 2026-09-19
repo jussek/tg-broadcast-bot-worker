@@ -55,7 +55,7 @@ class SchedulerService:
     async def process_task(self, task_id: str) -> Dict:
         """Process a scheduled task."""
         # Acquire lock to prevent duplicate processing
-        if not acquire_task_lock(task_id, ttl=120):
+        if not acquire_task_lock(task_id, seconds=120):
             return {"ok": False, "status": "already_processing"}
         
         try:
