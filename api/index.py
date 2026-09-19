@@ -322,6 +322,10 @@ async def create_and_schedule_task(user_id: int, state: Dict[str, Any]) -> str:
     save_task(task_id, task_data)
     ensure_redis()
     redis.sadd(get_user_tasks_key(user_id), task_id)
+    }
+    save_task(task_id, task_data)
+    ensure_redis()
+    redis.sadd(get_user_tasks_key(user_id), task_id)
 
     try:
         ensure_qstash()
@@ -704,6 +708,30 @@ async def cb_task_details(callback: types.CallbackQuery):
     await callback.answer()
 
 
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("task_details:"))
+async def cb_task_details(callback: types.CallbackQuery):
+    task_id = callback.data.split(":", 1)[1]
+    task = get_task(task_id)
+    if not task or task.get("user_id") != callback.from_user.id:
+        await callback.answer("Таймер не найден.", show_alert=True)
+        return
+    kb = []
+    if task.get("status") == "active":
+        kb.append([InlineKeyboardButton(text="🚫 Отменить таймер", callback_data=f"cancel_task:{task_id}")])
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="tasks")])
+    await callback.message.edit_text(
+        f"⏰ Таймер {task_id[:8]}\nСтатус: {task.get('status')}\n"
+        f"Интервал: {task.get('interval_minutes', 1)} мин.\n"
+        f"Повторы: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)}\n"
+        f"Каналов: {len(task.get('groups', []))}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+    )
+    await callback.answer()
+
+
 @dp.callback_query(lambda c: c.data.startswith("cancel_task:"))
 async def cb_cancel_task(callback: types.CallbackQuery):
     task_id = callback.data.split(":", 1)[1]
@@ -723,6 +751,43 @@ async def cb_groups(callback: types.CallbackQuery):
     kb.extend([InlineKeyboardButton(text=f"📋 {item['name']} ({len(item['groups'])})", callback_data=f"manage_group_list:{item['id']}")] for item in group_lists)
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
     await callback.message.edit_text("📋 Списки каналов для рассылки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "create_group_list")
+async def cb_create_group_list(callback: types.CallbackQuery):
+    set_user_state(callback.from_user.id, {"step": "selecting_group_list_channels", "selected_groups": []})
+    await fetch_and_show_groups(callback, callback.from_user.id)
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("manage_group_list:"))
+async def cb_manage_group_list(callback: types.CallbackQuery):
+    list_id = callback.data.split(":", 1)[1]
+    group_list = next((item for item in get_group_lists(callback.from_user.id) if item["id"] == list_id), None)
+    if not group_list:
+        await callback.answer("Список не найден.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить список", callback_data=f"delete_group_list:{list_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="groups")],
+    ])
+    await callback.message.edit_text(f"📋 <b>{group_list['name']}</b>\nКаналов в списке: {len(group_list['groups'])}", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("delete_group_list:"))
+async def cb_delete_group_list(callback: types.CallbackQuery):
+    list_id = callback.data.split(":", 1)[1]
+    save_group_lists(callback.from_user.id, [item for item in get_group_lists(callback.from_user.id) if item["id"] != list_id])
+    await cb_groups(callback)
+
+@dp.callback_query(lambda c: c.data == "settings")
+async def cb_settings(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "⚙️ Настройки\n\nДля работы бота должны быть заданы BOT_TOKEN, API_ID, API_HASH, TELEGRAM_SESSION_STRING, Upstash Redis и QStash.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")]]),
+    )
     await callback.answer()
 
 
