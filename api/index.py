@@ -228,6 +228,48 @@ def send_decision_keyboard():
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
+
+def parse_positive_integer(value: Optional[str]) -> Optional[int]:
+    """Return a positive integer entered by a user, or ``None`` if it is invalid."""
+    try:
+        number = int((value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+async def create_and_schedule_task(user_id: int, state: Dict[str, Any]) -> str:
+    """Persist a broadcast task and publish its first QStash delivery."""
+    import uuid
+
+    interval_minutes = state["interval_minutes"]
+    total_repeats = state["total_repeats"]
+    task_id = str(uuid.uuid4())
+    task_data = {
+        "task_id": task_id,
+        "user_id": user_id,
+        "message": state["message_text"],
+        "groups": state["selected_groups"],
+        "interval_minutes": interval_minutes,
+        "completed_repeats": 0,
+        "total_repeats": total_repeats,
+        "status": "active",
+    }
+    save_task(task_id, task_data)
+
+    try:
+        ensure_qstash()
+        qstash.message.publish_json(
+            url=f"{APP_URL}/api/process",
+            body={"task_id": task_id},
+            delay=f"{interval_minutes}m",
+        )
+    except Exception:
+        task_data["status"] = "error"
+        save_task(task_id, task_data)
+        raise
+    return task_id
+
 # --- Handlers ---
 
 @dp.message(Command("start", "s"))
@@ -424,7 +466,6 @@ async def cb_send_now(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "schedule_task")
 async def cb_schedule_task(callback: types.CallbackQuery):
-    # Simplified: Schedule for 1 minute later for demo
     user_id = callback.from_user.id
     state = get_user_state(user_id)
     msg_text = state.get("message_text")
@@ -434,36 +475,12 @@ async def cb_schedule_task(callback: types.CallbackQuery):
         await callback.answer("Ошибка данных.", show_alert=True)
         return
 
-    import uuid
-    task_id = str(uuid.uuid4())
-    task_data = {
-        "task_id": task_id,
-        "user_id": user_id,
-        "message": msg_text,
-        "groups": groups,
-        "completed_repeats": 0,
-        "total_repeats": 1,
-        "status": "active"
-    }
-    save_task(task_id, task_data)
-    
-    # Schedule QStash
-    # Note: QStash needs a public URL. Using APP_URL env.
-    target_url = f"{APP_URL}/api/process"
-    
-    try:
-        ensure_qstash()
-        qstash.message.publish_json(
-            url=target_url,
-            body={"task_id": task_id},
-            delay="1m" # Demo delay
-        )
-        clear_user_state(user_id)
-        await callback.message.edit_text(f"⏰ Таймер установлен. Задача {task_id[:8]} выполнена через 1 мин.", reply_markup=main_menu_keyboard())
-    except Exception as e:
-        logger.error(f"QStash error: {e}")
-        await callback.message.edit_text(f"❌ Ошибка планировщика: {e}")
-    
+    state["step"] = "waiting_for_interval"
+    set_user_state(user_id, state)
+    await callback.message.edit_text(
+        "⏰ Введите интервал в минутах между отправками (целое число больше 0):",
+        reply_markup=cancel_keyboard(),
+    )
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "cancel")
@@ -501,7 +518,44 @@ async def cb_back_broadcast(callback: types.CallbackQuery):
 async def handle_message(message: types.Message):
     user_id = message.from_user.id
     state = get_user_state(user_id)
-    
+
+    if state and state.get("step") == "waiting_for_interval":
+        interval_minutes = parse_positive_integer(message.text)
+        if interval_minutes is None:
+            await message.answer("Введите целое число минут больше 0.", reply_markup=cancel_keyboard())
+            return
+
+        state["interval_minutes"] = interval_minutes
+        state["step"] = "waiting_for_repeats"
+        set_user_state(user_id, state)
+        await message.answer(
+            "🔁 Введите количество отправок (целое число больше 0):",
+            reply_markup=cancel_keyboard(),
+        )
+        return
+
+    if state and state.get("step") == "waiting_for_repeats":
+        total_repeats = parse_positive_integer(message.text)
+        if total_repeats is None:
+            await message.answer("Введите целое число повторов больше 0.", reply_markup=cancel_keyboard())
+            return
+
+        state["total_repeats"] = total_repeats
+        try:
+            task_id = await create_and_schedule_task(user_id, state)
+        except Exception as e:
+            logger.error(f"QStash error: {e}")
+            await message.answer(f"❌ Ошибка планировщика: {e}", reply_markup=cancel_keyboard())
+            return
+
+        clear_user_state(user_id)
+        await message.answer(
+            f"⏰ Таймер установлен. Задача {task_id[:8]} начнётся через "
+            f"{state['interval_minutes']} мин. и выполнится {total_repeats} раз.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
     if state and state.get("step") == "waiting_for_message":
         text = message.text or message.caption
         if not text:
@@ -619,10 +673,21 @@ async def process_task(request: Request):
         if task["completed_repeats"] >= task.get("total_repeats", 1):
             task["status"] = "completed"
         else:
-            # Reschedule if repeats left (logic simplified)
             task["status"] = "active"
-            # Re-publish to QStash if needed for next repeat
-            pass
+            interval_minutes = task.get("interval_minutes", 1)
+            try:
+                ensure_qstash()
+                qstash.message.publish_json(
+                    url=f"{APP_URL}/api/process",
+                    body={"task_id": task_id},
+                    delay=f"{interval_minutes}m",
+                )
+            except Exception as e:
+                task["status"] = "error"
+                save_task(task_id, task)
+                release_task_lock(task_id)
+                logger.error(f"Unable to reschedule task {task_id}: {e}")
+                return JSONResponse(content={"ok": False, "error": str(e)})
             
         save_task(task_id, task)
         release_task_lock(task_id)
