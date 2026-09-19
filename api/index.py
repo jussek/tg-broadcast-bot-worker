@@ -297,6 +297,8 @@ def parse_positive_integer(value: Optional[str]) -> Optional[int]:
 
 async def create_and_schedule_task(user_id: int, state: Dict[str, Any]) -> str:
     """Persist a broadcast task and publish its first QStash delivery."""
+    import uuid
+
     interval_minutes = state["interval_minutes"]
     total_repeats = state["total_repeats"]
     task_id = str(uuid.uuid4())
@@ -314,6 +316,8 @@ async def create_and_schedule_task(user_id: int, state: Dict[str, Any]) -> str:
     save_task(task_id, task_data)
     ensure_redis()
     redis.sadd(get_user_tasks_key(user_id), task_id)
+    }
+    save_task(task_id, task_data)
 
     try:
         ensure_qstash()
