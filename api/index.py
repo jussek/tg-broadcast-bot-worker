@@ -17,6 +17,12 @@ from aiogram.filters import Command
 from upstash_redis import Redis
 from qstash import QStash
 from telethon import TelegramClient
+from telethon.sessions import StringSession
+
+# Configure logging before it is used during module import.  Vercel sets
+# VERCEL=1 (not "true"), so the previous ordering could crash cold starts.
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -31,14 +37,10 @@ TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 QSTASH_VERIFICATION_KEY = os.getenv("QSTASH_VERIFICATION_KEY")
 
 # Lazy initialization check - will be validated on first request in Vercel environment
-IS_VERCEL_ENV = os.getenv("VERCEL", "false").lower() == "true"
+IS_VERCEL_ENV = os.getenv("VERCEL", "").lower() in {"1", "true", "yes"}
 
 if not IS_VERCEL_ENV and not all([BOT_TOKEN, API_ID, API_HASH, TELEGRAM_SESSION_STRING, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, QSTASH_TOKEN]):
     logger.warning("Missing required environment variables. App will fail on first request if not set.")
-
-# --- Logging ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # --- Init Clients (Lazy Initialization for Local Testing) ---
 # In Vercel, env vars are always set. For local testing, we defer initialization.
@@ -58,37 +60,45 @@ def get_bot():
     return Bot(token=BOT_TOKEN)
 
 # Initialize only if env vars are present (Vercel production)
-if IS_VERCEL_ENV:
-    redis = get_redis()
-    qstash = get_qstash()
-    bot = get_bot()
-else:
-    # Lazy init for local dev - will be created on first use
-    redis = None
-    qstash = None
-    bot = None
+# Keep all external clients lazy.  Constructing them during import makes a
+# serverless cold start fail before FastAPI can report a useful error.
+redis = None
+qstash = None
+bot = None
 
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 # Helper to ensure clients are initialized
-def ensure_clients():
-    global redis, qstash, bot
+def ensure_redis():
+    global redis
     if redis is None:
         redis = get_redis()
+
+
+def ensure_qstash():
+    global qstash
     if qstash is None:
         qstash = get_qstash()
+
+
+def ensure_bot():
+    global bot
     if bot is None:
         bot = get_bot()
 
+
+def ensure_clients():
+    """Backward-compatible initializer for operations needing every client."""
+    ensure_redis()
+    ensure_qstash()
+    ensure_bot()
+
 # --- Telethon Helper ---
 async def get_telethon_client() -> TelegramClient:
-    client = TelegramClient(
-        session="session_name", # Session name doesn't matter with string
-        api_id=int(API_ID),
-        api_hash=API_HASH,
-        session_string=TELEGRAM_SESSION_STRING
-    )
+    if not API_ID or not API_HASH or not TELEGRAM_SESSION_STRING:
+        raise RuntimeError("Telegram API credentials are not configured")
+    client = TelegramClient(StringSession(TELEGRAM_SESSION_STRING), int(API_ID), API_HASH)
     await client.connect()
     if not await client.is_user_authorized():
         await client.disconnect()
@@ -100,12 +110,12 @@ def get_user_state_key(user_id: int) -> str:
     return f"broadcast:state:{user_id}"
 
 def get_user_state(user_id: int) -> Optional[Dict[str, Any]]:
-    ensure_clients()
+    ensure_redis()
     data = redis.get(get_user_state_key(user_id))
     return json.loads(data) if data else None
 
 def set_user_state(user_id: int, state: Dict[str, Any]):
-    ensure_clients()
+    ensure_redis()
     # Convert sets to lists for JSON serialization
     clean_state = {}
     for k, v in state.items():
@@ -116,18 +126,18 @@ def set_user_state(user_id: int, state: Dict[str, Any]):
     redis.set(get_user_state_key(user_id), json.dumps(clean_state))
 
 def clear_user_state(user_id: int):
-    ensure_clients()
+    ensure_redis()
     redis.delete(get_user_state_key(user_id))
 
 def get_last_message_key(user_id: int) -> str:
     return f"broadcast:user:{user_id}:last_message"
 
 def save_last_message(user_id: int, message_text: str):
-    ensure_clients()
+    ensure_redis()
     redis.set(get_last_message_key(user_id), message_text)
 
 def get_last_message(user_id: int) -> Optional[str]:
-    ensure_clients()
+    ensure_redis()
     return redis.get(get_last_message_key(user_id))
 
 # Task helpers
@@ -138,22 +148,23 @@ def get_task_lock_key(task_id: str) -> str:
     return f"broadcast:lock:{task_id}"
 
 def acquire_task_lock(task_id: str, ttl: int = 60) -> bool:
-    ensure_clients()
+    ensure_redis()
     key = get_task_lock_key(task_id)
     # NX = only set if not exists, EX = expiration in seconds
-    return redis.set(key, "locked", nx=True, ex=ttl) == 1
+    result = redis.set(key, "locked", nx=True, ex=ttl)
+    return result in (True, 1, "OK")
 
 def release_task_lock(task_id: str):
-    ensure_clients()
+    ensure_redis()
     redis.delete(get_task_lock_key(task_id))
 
 def get_task(task_id: str) -> Optional[Dict]:
-    ensure_clients()
+    ensure_redis()
     data = redis.get(get_task_key(task_id))
     return json.loads(data) if data else None
 
 def save_task(task_id: str, task_data: Dict):
-    ensure_clients()
+    ensure_redis()
     redis.set(get_task_key(task_id), json.dumps(task_data))
 
 # Template helpers
@@ -161,12 +172,12 @@ def get_templates_key(user_id: int) -> str:
     return f"broadcast:templates:{user_id}"
 
 def get_user_templates(user_id: int) -> list:
-    ensure_clients()
+    ensure_redis()
     data = redis.get(get_templates_key(user_id))
     return json.loads(data) if data else []
 
 def save_user_templates(user_id: int, templates: list):
-    ensure_clients()
+    ensure_redis()
     redis.set(get_templates_key(user_id), json.dumps(templates))
 
 # --- Keyboards ---
@@ -201,7 +212,8 @@ def groups_selection_keyboard(selected_ids: list, all_groups: list):
         is_selected = gid in selected_ids
         symbol = "☑️" if is_selected else "☐"
         cb_data = f"toggle_group:{gid}"
-        kb.append([InlineKeyboardButton(text=f"{symbol} {g.title}", callback_data=cb_data)])
+        title = getattr(g, "title", None) or getattr(g, "name", None) or gid
+        kb.append([InlineKeyboardButton(text=f"{symbol} {title}", callback_data=cb_data)])
     
     kb.append([InlineKeyboardButton(text="☑️ Выбрать все", callback_data="select_all_groups")])
     kb.append([InlineKeyboardButton(text="➡️ Продолжить", callback_data="continue_to_send")])
@@ -220,13 +232,16 @@ def send_decision_keyboard():
 
 @dp.message(Command("start", "s"))
 async def cmd_start(message: types.Message):
-    await clear_user_state(message.from_user.id)
+    try:
+        clear_user_state(message.from_user.id)
+    except Exception:
+        logger.exception("Unable to clear state for user %s", message.from_user.id)
     text = "🤖 Панель рассылки\n\nВыбери действие:"
     await message.answer(text, reply_markup=main_menu_keyboard())
 
 @dp.callback_query(lambda c: c.data == "back_menu")
 async def cb_back_menu(callback: types.CallbackQuery):
-    await clear_user_state(callback.from_user.id)
+    clear_user_state(callback.from_user.id)
     text = "🤖 Панель рассылки\n\nВыбери действие:"
     await callback.message.edit_text(text, reply_markup=main_menu_keyboard())
     await callback.answer()
@@ -238,7 +253,7 @@ async def cb_new_broadcast(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "write_message")
 async def cb_write_message(callback: types.CallbackQuery):
-    await set_user_state(callback.from_user.id, {"step": "waiting_for_message"})
+    set_user_state(callback.from_user.id, {"step": "waiting_for_message"})
     await callback.message.edit_text("📝 Введите текст сообщения для рассылки:", reply_markup=cancel_keyboard())
     await callback.answer()
 
@@ -250,7 +265,7 @@ async def cb_use_last_message(callback: types.CallbackQuery):
         await callback.answer("⚠️ Последнее сообщение не найдено.", show_alert=True)
         return
     
-    await set_user_state(user_id, {"step": "selecting_groups", "message_text": last_msg, "selected_groups": []})
+    set_user_state(user_id, {"step": "selecting_groups", "message_text": last_msg, "selected_groups": []})
     await fetch_and_show_groups(callback, user_id)
     await callback.answer()
 
@@ -283,7 +298,7 @@ async def cb_use_template(callback: types.CallbackQuery):
         await callback.answer("Шаблон не найден.", show_alert=True)
         return
 
-    await set_user_state(user_id, {"step": "selecting_groups", "message_text": template['message'], "selected_groups": []})
+    set_user_state(user_id, {"step": "selecting_groups", "message_text": template['message'], "selected_groups": []})
     await fetch_and_show_groups(callback, user_id)
     await callback.answer()
 
@@ -299,7 +314,7 @@ async def fetch_and_show_groups(callback: types.CallbackQuery, user_id: int):
         # Store full list in Redis temporarily (simplified for this example)
         # In prod, store IDs and names only
         group_data = [{"id": str(d.id), "title": d.name} for d in dialogs]
-        ensure_clients()
+        ensure_redis()
         redis.set(f"broadcast:groups:{user_id}", json.dumps(group_data))
         
         state = get_user_state(user_id)
@@ -324,10 +339,10 @@ async def cb_toggle_group(callback: types.CallbackQuery):
         selected.append(gid)
     
     state["selected_groups"] = selected
-    await set_user_state(user_id, state)
+    set_user_state(user_id, state)
     
     # Refresh keyboard
-    ensure_clients()
+    ensure_redis()
     group_data_json = redis.get(f"broadcast:groups:{user_id}")
     group_data = json.loads(group_data_json) if group_data_json else []
     # Reconstruct dummy objects for keyboard func
@@ -340,14 +355,14 @@ async def cb_toggle_group(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "select_all_groups")
 async def cb_select_all_groups(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    ensure_clients()
+    ensure_redis()
     group_data_json = redis.get(f"broadcast:groups:{user_id}")
     group_data = json.loads(group_data_json) if group_data_json else []
     
     all_ids = [g['id'] for g in group_data]
     state = get_user_state(user_id)
     state["selected_groups"] = all_ids
-    await set_user_state(user_id, state)
+    set_user_state(user_id, state)
     
     dialogs = [type('obj', (object,), {'id': g['id'], 'title': g['title']}) for g in group_data]
     kb = groups_selection_keyboard(all_ids, dialogs)
@@ -398,12 +413,12 @@ async def cb_send_now(callback: types.CallbackQuery):
     except Exception as e:
         logger.error(f"Telethon error: {e}")
         await callback.message.edit_text(f"❌ Ошибка отправки: {str(e)}")
-        await clear_user_state(user_id)
+        clear_user_state(user_id)
         return
 
     # Save last message
     save_last_message(user_id, msg_text)
-    await clear_user_state(user_id)
+    clear_user_state(user_id)
     
     await callback.message.edit_text(f"✅ Рассылка завершена\n\n📨 Успешно: {success_count}\n❌ Ошибок: {error_count}", reply_markup=main_menu_keyboard())
 
@@ -437,13 +452,13 @@ async def cb_schedule_task(callback: types.CallbackQuery):
     target_url = f"{APP_URL}/api/process"
     
     try:
-        ensure_clients()
+        ensure_qstash()
         qstash.message.publish_json(
             url=target_url,
             body={"task_id": task_id},
             delay="1m" # Demo delay
         )
-        await clear_user_state(user_id)
+        clear_user_state(user_id)
         await callback.message.edit_text(f"⏰ Таймер установлен. Задача {task_id[:8]} выполнена через 1 мин.", reply_markup=main_menu_keyboard())
     except Exception as e:
         logger.error(f"QStash error: {e}")
@@ -453,7 +468,7 @@ async def cb_schedule_task(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "cancel")
 async def cb_cancel(callback: types.CallbackQuery):
-    await clear_user_state(callback.from_user.id)
+    clear_user_state(callback.from_user.id)
     await callback.message.edit_text("Отменено.", reply_markup=main_menu_keyboard())
     await callback.answer()
 
@@ -496,7 +511,7 @@ async def handle_message(message: types.Message):
         # Escape HTML just in case, though Telethon handles it mostly
         safe_text = html.escape(text) 
         
-        await set_user_state(user_id, {"step": "selecting_groups", "message_text": safe_text, "selected_groups": []})
+        set_user_state(user_id, {"step": "selecting_groups", "message_text": safe_text, "selected_groups": []})
         
         # Fetch groups
         try:
@@ -508,7 +523,7 @@ async def handle_message(message: types.Message):
             await client.disconnect()
             
             group_data = [{"id": str(d.id), "title": d.name} for d in dialogs]
-            ensure_clients()
+            ensure_redis()
             redis.set(f"broadcast:groups:{user_id}", json.dumps(group_data))
             
             kb = groups_selection_keyboard([], dialogs)
@@ -516,7 +531,7 @@ async def handle_message(message: types.Message):
         except Exception as e:
             logger.error(f"Error fetching groups: {e}")
             await message.answer("Ошибка получения групп.")
-            await clear_user_state(user_id)
+            clear_user_state(user_id)
     else:
         await message.answer("Неизвестная команда. Нажмите /start")
 
@@ -530,7 +545,7 @@ async def root():
 @app.get("/health")
 async def health_check():
     try:
-        ensure_clients()
+        ensure_redis()
         redis.ping()
         redis_status = "ok"
     except:
@@ -544,11 +559,12 @@ async def health_check():
 
 @app.post("/api/webhook")
 async def webhook_handler(request: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(None)):
-    if x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
+    if TELEGRAM_WEBHOOK_SECRET and x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret token")
     
     try:
         body = await request.json()
+        ensure_bot()
         update = Update(**body)
         await dp.feed_update(bot, update)
         return JSONResponse(content={"ok": True})
@@ -619,8 +635,8 @@ async def process_task(request: Request):
 
 @app.on_event("startup")
 async def on_startup():
-    ensure_clients()
-    if APP_URL:
+    if BOT_TOKEN and APP_URL:
+        ensure_bot()
         webhook_url = f"{APP_URL}/api/webhook"
         await bot.set_webhook(webhook_url, secret_token=TELEGRAM_WEBHOOK_SECRET)
         logger.info(f"Webhook set to {webhook_url}")
