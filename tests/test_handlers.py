@@ -149,3 +149,26 @@ def test_active_timer_can_be_cancelled(monkeypatch):
 
     assert saved_tasks == [("task-1", {"task_id": "task-1", "user_id": 42, "status": "cancelled"})]
     assert callback.answers[0][0] == "Таймер отменён."
+
+
+def test_scheduled_task_records_next_run(monkeypatch):
+    state = {
+        "message_text": "Hello",
+        "selected_groups": ["-1001"],
+        "interval_minutes": 5,
+        "total_repeats": 2,
+    }
+    saved_tasks = []
+
+    monkeypatch.setattr(index, "save_task", lambda task_id, task: saved_tasks.append(task.copy()))
+    monkeypatch.setattr(index, "ensure_redis", lambda: None)
+    monkeypatch.setattr(index, "redis", SimpleNamespace(sadd=lambda *_args: None))
+    monkeypatch.setattr(index, "ensure_qstash", lambda: None)
+    monkeypatch.setattr(index, "qstash", SimpleNamespace(message=SimpleNamespace(publish_json=lambda **_kwargs: None)))
+    monkeypatch.setattr(index.uuid, "uuid4", lambda: "task-id")
+    monkeypatch.setattr(index.time, "time", lambda: 1_000.0)
+
+    task_id = asyncio.run(index.create_and_schedule_task(42, state))
+
+    assert task_id == "task-id"
+    assert saved_tasks[0]["next_run"] == 1_300.0

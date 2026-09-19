@@ -317,6 +317,7 @@ async def create_and_schedule_task(user_id: int, state: Dict[str, Any]) -> str:
         "total_repeats": total_repeats,
         "status": "active",
         "created_at": time.time(),
+        "next_run": time.time() + interval_minutes * 60,
     }
     save_task(task_id, task_data)
     ensure_redis()
@@ -694,6 +695,9 @@ async def cb_task_details(callback: types.CallbackQuery):
         f"⏰ Таймер {task_id[:8]}\nСтатус: {task.get('status')}\n"
         f"Интервал: {task.get('interval_minutes', 1)} мин.\n"
         f"Повторы: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)}\n"
+        f"Каналов: {len(task.get('groups', []))}"
+        + (f"\nСледующий запуск: {time.strftime('%d.%m.%Y %H:%M UTC', time.gmtime(task['next_run']))}"
+           if task.get("status") == "active" and task.get("next_run") else ""),
         f"Каналов: {len(task.get('groups', []))}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
     )
@@ -936,6 +940,7 @@ async def process_task(request: Request):
         else:
             task["status"] = "active"
             interval_minutes = task.get("interval_minutes", 1)
+            task["next_run"] = time.time() + interval_minutes * 60
             try:
                 ensure_qstash()
                 qstash.message.publish_json(
