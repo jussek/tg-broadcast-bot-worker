@@ -14,7 +14,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from upstash_redis import Redis
-from qstash.client import Client as QStashClient
+from qstash import QStash
 from telethon import TelegramClient
 
 # --- Configuration ---
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 # --- Init Clients ---
 redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
-qstash = QStashClient(token=QSTASH_TOKEN)
+qstash = QStash(token=QSTASH_TOKEN)
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage() # Для FSM контекста, состояние храним в Redis вручную
 dp = Dispatcher(storage=storage)
@@ -385,7 +385,7 @@ async def cb_schedule_task(callback: types.CallbackQuery):
     target_url = f"{APP_URL}/api/process"
     
     try:
-        qstash.publish_json(
+        qstash.message.publish_json(
             url=target_url,
             body={"task_id": task_id},
             delay="1m" # Demo delay

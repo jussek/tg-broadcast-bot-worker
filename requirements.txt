@@ -3,6 +3,6 @@ uvicorn==0.30.6
 aiogram==3.13.1
 telethon==1.36.0
 upstash-redis>=1.0.0
-qstash>=0.3.0
+qstash>=2.0.0
 python-dotenv==1.0.1
 pydantic==2.9.2
