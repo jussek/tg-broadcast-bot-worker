@@ -114,7 +114,15 @@ def get_user_state_key(user_id: int) -> str:
 def get_user_state(user_id: int) -> Optional[Dict[str, Any]]:
     ensure_redis()
     data = redis.get(get_user_state_key(user_id))
-    return json.loads(data) if data else None
+    if not data:
+        return None
+    # Upstash clients may return a decoded object or the JSON string that was
+    # stored with ``set`` depending on the client/runtime version.
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, bytes):
+        data = data.decode()
+    return json.loads(data)
 
 def set_user_state(user_id: int, state: Dict[str, Any]):
     ensure_redis()
