@@ -698,6 +698,7 @@ async def cb_task_details(callback: types.CallbackQuery):
         f"Каналов: {len(task.get('groups', []))}"
         + (f"\nСледующий запуск: {time.strftime('%d.%m.%Y %H:%M UTC', time.gmtime(task['next_run']))}"
            if task.get("status") == "active" and task.get("next_run") else ""),
+        f"Каналов: {len(task.get('groups', []))}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
     )
     await callback.answer()
