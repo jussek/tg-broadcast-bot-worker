@@ -1,5 +1,6 @@
 """Telegram service using Telethon for user API."""
 import os
+import asyncio
 from typing import List, Dict, Optional
 from telethon import TelegramClient
 from telethon.sessions import StringSession

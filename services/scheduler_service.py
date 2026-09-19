@@ -52,7 +52,7 @@ class SchedulerService:
             print(f"Ошибка планирования задачи {task_id}: {e}")
             return False
     
-    def process_task(self, task_id: str) -> Dict:
+    async def process_task(self, task_id: str) -> Dict:
         """Process a scheduled task."""
         # Acquire lock to prevent duplicate processing
         if not acquire_task_lock(task_id, ttl=120):
@@ -136,4 +136,4 @@ def schedule_task(task_id: str, delay_minutes: int = 1) -> bool:
 async def process_scheduled_task(task_id: str) -> Dict:
     """Process a scheduled task."""
     scheduler = get_scheduler()
-    return scheduler.process_task(task_id)
+    return await scheduler.process_task(task_id)
