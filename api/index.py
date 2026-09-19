@@ -297,6 +297,8 @@ def parse_positive_integer(value: Optional[str]) -> Optional[int]:
 
 async def create_and_schedule_task(user_id: int, state: Dict[str, Any]) -> str:
     """Persist a broadcast task and publish its first QStash delivery."""
+    import uuid
+
     interval_minutes = state["interval_minutes"]
     total_repeats = state["total_repeats"]
     task_id = str(uuid.uuid4())
@@ -309,11 +311,8 @@ async def create_and_schedule_task(user_id: int, state: Dict[str, Any]) -> str:
         "completed_repeats": 0,
         "total_repeats": total_repeats,
         "status": "active",
-        "created_at": time.time(),
     }
     save_task(task_id, task_data)
-    ensure_redis()
-    redis.sadd(get_user_tasks_key(user_id), task_id)
 
     try:
         ensure_qstash()
@@ -760,41 +759,6 @@ async def cb_back_broadcast(callback: types.CallbackQuery):
 async def handle_message(message: types.Message):
     user_id = message.from_user.id
     state = get_user_state(user_id)
-
-    if state and state.get("step") == "waiting_for_template_name":
-        name = (message.text or "").strip()
-        if not name:
-            await message.answer("Введите непустое название шаблона.", reply_markup=cancel_keyboard())
-            return
-        state["template_name"] = name
-        state["step"] = "waiting_for_template_message"
-        set_user_state(user_id, state)
-        await message.answer("Введите текст шаблона:", reply_markup=cancel_keyboard())
-        return
-
-    if state and state.get("step") == "waiting_for_template_message":
-        text = message.text or message.caption
-        if not text:
-            await message.answer("Отправьте текст шаблона.", reply_markup=cancel_keyboard())
-            return
-        templates = get_user_templates(user_id)
-        templates.append({"id": str(uuid.uuid4()), "name": state["template_name"], "message": html.escape(text)})
-        save_user_templates(user_id, templates)
-        clear_user_state(user_id)
-        await message.answer("✅ Шаблон сохранён.", reply_markup=main_menu_keyboard())
-        return
-
-    if state and state.get("step") == "waiting_for_group_list_name":
-        name = (message.text or "").strip()
-        if not name:
-            await message.answer("Введите непустое название списка.", reply_markup=cancel_keyboard())
-            return
-        group_lists = get_group_lists(user_id)
-        group_lists.append({"id": str(uuid.uuid4()), "name": name, "groups": state["selected_groups"]})
-        save_group_lists(user_id, group_lists)
-        clear_user_state(user_id)
-        await message.answer(f"✅ Список «{name}» сохранён.", reply_markup=main_menu_keyboard())
-        return
 
     if state and state.get("step") == "waiting_for_interval":
         interval_minutes = parse_positive_integer(message.text)
