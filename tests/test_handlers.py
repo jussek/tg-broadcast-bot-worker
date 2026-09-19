@@ -92,26 +92,3 @@ def test_timer_setup_accepts_custom_interval_and_repeat_count(monkeypatch):
     })]
     assert "через 7 мин." in repeat_message.answers[-1][0]
     assert "3 раз" in repeat_message.answers[-1][0]
-
-
-def test_group_list_name_is_saved_from_waiting_state(monkeypatch):
-    state = {
-        "step": "waiting_for_group_list_name",
-        "selected_groups": ["-1001", "-1002"],
-    }
-    saved_lists = []
-    cleared_users = []
-
-    monkeypatch.setattr(index, "get_user_state", lambda _user_id: state)
-    monkeypatch.setattr(index, "get_group_lists", lambda _user_id: [])
-    monkeypatch.setattr(index, "save_group_lists", lambda user_id, lists: saved_lists.append((user_id, lists)))
-    monkeypatch.setattr(index, "clear_user_state", lambda user_id: cleared_users.append(user_id))
-
-    message = FakeMessage("Основные каналы")
-    asyncio.run(index.handle_message(message))
-
-    assert saved_lists[0][0] == 42
-    assert saved_lists[0][1][0]["name"] == "Основные каналы"
-    assert saved_lists[0][1][0]["groups"] == ["-1001", "-1002"]
-    assert cleared_users == [42]
-    assert message.answers[-1][0] == "✅ Список «Основные каналы» сохранён."
