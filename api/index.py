@@ -26,23 +26,60 @@ TELEGRAM_SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 QSTASH_TOKEN = os.getenv("QSTASH_TOKEN")
-APP_URL = os.getenv("APP_URL", "").rstrip("/")
+APP_URL = os.getenv("APP_URL", "https://tg-broadcast-bot-worker.vercel.app").rstrip("/")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
-QSTASH_VERIFICATION_KEY = os.getenv("QSTASH_VERIFICATION_KEY") # Для проверки подписи QStash если нужно
+QSTASH_VERIFICATION_KEY = os.getenv("QSTASH_VERIFICATION_KEY")
 
-if not all([BOT_TOKEN, API_ID, API_HASH, TELEGRAM_SESSION_STRING, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, QSTASH_TOKEN]):
-    raise ValueError("Missing required environment variables")
+# Lazy initialization check - will be validated on first request in Vercel environment
+IS_VERCEL_ENV = os.getenv("VERCEL", "false").lower() == "true"
+
+if not IS_VERCEL_ENV and not all([BOT_TOKEN, API_ID, API_HASH, TELEGRAM_SESSION_STRING, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, QSTASH_TOKEN]):
+    logger.warning("Missing required environment variables. App will fail on first request if not set.")
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Init Clients ---
-redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
-qstash = QStash(token=QSTASH_TOKEN)
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage() # Для FSM контекста, состояние храним в Redis вручную
+# --- Init Clients (Lazy Initialization for Local Testing) ---
+# In Vercel, env vars are always set. For local testing, we defer initialization.
+def get_redis():
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        raise RuntimeError("Redis credentials not set")
+    return Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
+
+def get_qstash():
+    if not QSTASH_TOKEN:
+        raise RuntimeError("QStash token not set")
+    return QStash(token=QSTASH_TOKEN)
+
+def get_bot():
+    if not BOT_TOKEN:
+        raise RuntimeError("Bot token not set")
+    return Bot(token=BOT_TOKEN)
+
+# Initialize only if env vars are present (Vercel production)
+if IS_VERCEL_ENV:
+    redis = get_redis()
+    qstash = get_qstash()
+    bot = get_bot()
+else:
+    # Lazy init for local dev - will be created on first use
+    redis = None
+    qstash = None
+    bot = None
+
+storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+# Helper to ensure clients are initialized
+def ensure_clients():
+    global redis, qstash, bot
+    if redis is None:
+        redis = get_redis()
+    if qstash is None:
+        qstash = get_qstash()
+    if bot is None:
+        bot = get_bot()
 
 # --- Telethon Helper ---
 async def get_telethon_client() -> TelegramClient:
@@ -63,10 +100,12 @@ def get_user_state_key(user_id: int) -> str:
     return f"broadcast:state:{user_id}"
 
 def get_user_state(user_id: int) -> Optional[Dict[str, Any]]:
+    ensure_clients()
     data = redis.get(get_user_state_key(user_id))
     return json.loads(data) if data else None
 
 def set_user_state(user_id: int, state: Dict[str, Any]):
+    ensure_clients()
     # Convert sets to lists for JSON serialization
     clean_state = {}
     for k, v in state.items():
@@ -77,15 +116,18 @@ def set_user_state(user_id: int, state: Dict[str, Any]):
     redis.set(get_user_state_key(user_id), json.dumps(clean_state))
 
 def clear_user_state(user_id: int):
+    ensure_clients()
     redis.delete(get_user_state_key(user_id))
 
 def get_last_message_key(user_id: int) -> str:
     return f"broadcast:user:{user_id}:last_message"
 
 def save_last_message(user_id: int, message_text: str):
+    ensure_clients()
     redis.set(get_last_message_key(user_id), message_text)
 
 def get_last_message(user_id: int) -> Optional[str]:
+    ensure_clients()
     return redis.get(get_last_message_key(user_id))
 
 # Task helpers
@@ -96,18 +138,22 @@ def get_task_lock_key(task_id: str) -> str:
     return f"broadcast:lock:{task_id}"
 
 def acquire_task_lock(task_id: str, ttl: int = 60) -> bool:
+    ensure_clients()
     key = get_task_lock_key(task_id)
     # NX = only set if not exists, EX = expiration in seconds
     return redis.set(key, "locked", nx=True, ex=ttl) == 1
 
 def release_task_lock(task_id: str):
+    ensure_clients()
     redis.delete(get_task_lock_key(task_id))
 
 def get_task(task_id: str) -> Optional[Dict]:
+    ensure_clients()
     data = redis.get(get_task_key(task_id))
     return json.loads(data) if data else None
 
 def save_task(task_id: str, task_data: Dict):
+    ensure_clients()
     redis.set(get_task_key(task_id), json.dumps(task_data))
 
 # Template helpers
@@ -115,10 +161,12 @@ def get_templates_key(user_id: int) -> str:
     return f"broadcast:templates:{user_id}"
 
 def get_user_templates(user_id: int) -> list:
+    ensure_clients()
     data = redis.get(get_templates_key(user_id))
     return json.loads(data) if data else []
 
 def save_user_templates(user_id: int, templates: list):
+    ensure_clients()
     redis.set(get_templates_key(user_id), json.dumps(templates))
 
 # --- Keyboards ---
@@ -251,6 +299,7 @@ async def fetch_and_show_groups(callback: types.CallbackQuery, user_id: int):
         # Store full list in Redis temporarily (simplified for this example)
         # In prod, store IDs and names only
         group_data = [{"id": str(d.id), "title": d.name} for d in dialogs]
+        ensure_clients()
         redis.set(f"broadcast:groups:{user_id}", json.dumps(group_data))
         
         state = get_user_state(user_id)
@@ -278,6 +327,7 @@ async def cb_toggle_group(callback: types.CallbackQuery):
     await set_user_state(user_id, state)
     
     # Refresh keyboard
+    ensure_clients()
     group_data_json = redis.get(f"broadcast:groups:{user_id}")
     group_data = json.loads(group_data_json) if group_data_json else []
     # Reconstruct dummy objects for keyboard func
@@ -290,6 +340,7 @@ async def cb_toggle_group(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "select_all_groups")
 async def cb_select_all_groups(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    ensure_clients()
     group_data_json = redis.get(f"broadcast:groups:{user_id}")
     group_data = json.loads(group_data_json) if group_data_json else []
     
@@ -386,6 +437,7 @@ async def cb_schedule_task(callback: types.CallbackQuery):
     target_url = f"{APP_URL}/api/process"
     
     try:
+        ensure_clients()
         qstash.message.publish_json(
             url=target_url,
             body={"task_id": task_id},
@@ -456,6 +508,7 @@ async def handle_message(message: types.Message):
             await client.disconnect()
             
             group_data = [{"id": str(d.id), "title": d.name} for d in dialogs]
+            ensure_clients()
             redis.set(f"broadcast:groups:{user_id}", json.dumps(group_data))
             
             kb = groups_selection_keyboard([], dialogs)
@@ -477,6 +530,7 @@ async def root():
 @app.get("/health")
 async def health_check():
     try:
+        ensure_clients()
         redis.ping()
         redis_status = "ok"
     except:
@@ -565,6 +619,7 @@ async def process_task(request: Request):
 
 @app.on_event("startup")
 async def on_startup():
+    ensure_clients()
     if APP_URL:
         webhook_url = f"{APP_URL}/api/webhook"
         await bot.set_webhook(webhook_url, secret_token=TELEGRAM_WEBHOOK_SECRET)
