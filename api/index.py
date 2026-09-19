@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import time
+import uuid
 import html
 from typing import Optional, Dict, Any
 
@@ -180,6 +182,33 @@ def save_user_templates(user_id: int, templates: list):
     ensure_redis()
     redis.set(get_templates_key(user_id), json.dumps(templates))
 
+def get_group_lists_key(user_id: int) -> str:
+    return f"broadcast:group-lists:{user_id}"
+
+def get_group_lists(user_id: int) -> list:
+    ensure_redis()
+    data = redis.get(get_group_lists_key(user_id))
+    return json.loads(data) if data else []
+
+def save_group_lists(user_id: int, group_lists: list):
+    ensure_redis()
+    redis.set(get_group_lists_key(user_id), json.dumps(group_lists, ensure_ascii=False))
+
+def get_user_tasks_key(user_id: int) -> str:
+    return f"broadcast:user:{user_id}:tasks"
+
+def get_user_tasks(user_id: int) -> list:
+    ensure_redis()
+    task_ids = redis.smembers(get_user_tasks_key(user_id)) or []
+    tasks = []
+    for task_id in task_ids:
+        if isinstance(task_id, bytes):
+            task_id = task_id.decode()
+        task = get_task(str(task_id))
+        if task:
+            tasks.append(task)
+    return sorted(tasks, key=lambda task: task.get("created_at", 0), reverse=True)
+
 # --- Keyboards ---
 def main_menu_keyboard():
     kb = [
@@ -205,9 +234,12 @@ def cancel_keyboard():
     kb = [[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-def groups_selection_keyboard(selected_ids: list, all_groups: list):
+def groups_selection_keyboard(selected_ids: list, all_groups: list, page: int = 0):
+    page_size = 20
+    page_count = max(1, (len(all_groups) + page_size - 1) // page_size)
+    page = max(0, min(page, page_count - 1))
     kb = []
-    for g in all_groups[:10]: # Limit to 10 for display
+    for g in all_groups[page * page_size:(page + 1) * page_size]:
         gid = str(g.id)
         is_selected = gid in selected_ids
         symbol = "☑️" if is_selected else "☐"
@@ -215,10 +247,35 @@ def groups_selection_keyboard(selected_ids: list, all_groups: list):
         title = getattr(g, "title", None) or getattr(g, "name", None) or gid
         kb.append([InlineKeyboardButton(text=f"{symbol} {title}", callback_data=cb_data)])
     
+    if page_count > 1:
+        navigation = []
+        if page:
+            navigation.append(InlineKeyboardButton(text="◀️", callback_data=f"groups_page:{page - 1}"))
+        navigation.append(InlineKeyboardButton(text=f"Страница {page + 1}/{page_count}", callback_data="ignore"))
+        if page < page_count - 1:
+            navigation.append(InlineKeyboardButton(text="▶️", callback_data=f"groups_page:{page + 1}"))
+        kb.append(navigation)
     kb.append([InlineKeyboardButton(text="☑️ Выбрать все", callback_data="select_all_groups")])
     kb.append([InlineKeyboardButton(text="➡️ Продолжить", callback_data="continue_to_send")])
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_broadcast")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def group_lists_keyboard(group_lists: list, prefix: str, back_callback: str = "back_menu"):
+    kb = [
+        [InlineKeyboardButton(text=f"📋 {item['name']} ({len(item['groups'])})", callback_data=f"{prefix}:{item['id']}")]
+        for item in group_lists
+    ]
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def group_source_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📣 Выбрать каналы вручную", callback_data="select_live_groups")],
+        [InlineKeyboardButton(text="📋 Использовать сохранённый список", callback_data="select_group_list")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="new_broadcast")],
+    ])
 
 def send_decision_keyboard():
     kb = [
@@ -308,8 +365,14 @@ async def cb_use_last_message(callback: types.CallbackQuery):
         return
     
     set_user_state(user_id, {"step": "selecting_groups", "message_text": last_msg, "selected_groups": []})
-    await fetch_and_show_groups(callback, user_id)
+    await callback.message.edit_text("Выберите источник каналов:", reply_markup=group_source_keyboard())
     await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "last_message")
+async def cb_last_message(callback: types.CallbackQuery):
+    """Open the last message flow from the main menu."""
+    await cb_use_last_message(callback)
 
 @dp.callback_query(lambda c: c.data == "select_template")
 async def cb_select_template(callback: types.CallbackQuery):
@@ -341,7 +404,43 @@ async def cb_use_template(callback: types.CallbackQuery):
         return
 
     set_user_state(user_id, {"step": "selecting_groups", "message_text": template['message'], "selected_groups": []})
-    await fetch_and_show_groups(callback, user_id)
+    await callback.message.edit_text("Выберите источник каналов:", reply_markup=group_source_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "select_live_groups")
+async def cb_select_live_groups(callback: types.CallbackQuery):
+    await fetch_and_show_groups(callback, callback.from_user.id)
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "select_group_list")
+async def cb_select_group_list(callback: types.CallbackQuery):
+    group_lists = get_group_lists(callback.from_user.id)
+    if not group_lists:
+        await callback.answer("Сохранённых списков пока нет.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "📋 Выберите список каналов для рассылки:",
+        reply_markup=group_lists_keyboard(group_lists, "use_group_list", "new_broadcast"),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("use_group_list:"))
+async def cb_use_group_list(callback: types.CallbackQuery):
+    list_id = callback.data.split(":", 1)[1]
+    group_list = next((item for item in get_group_lists(callback.from_user.id) if item["id"] == list_id), None)
+    state = get_user_state(callback.from_user.id)
+    if not group_list or not state or not state.get("message_text"):
+        await callback.answer("Список или сообщение не найдены.", show_alert=True)
+        return
+    state["selected_groups"] = group_list["groups"]
+    set_user_state(callback.from_user.id, state)
+    await callback.message.edit_text(
+        f"📋 Используется список «{group_list['name']}» ({len(group_list['groups'])} каналов).\n\nКак отправить сообщение?",
+        reply_markup=send_decision_keyboard(),
+    )
     await callback.answer()
 
 async def fetch_and_show_groups(callback: types.CallbackQuery, user_id: int):
@@ -362,7 +461,7 @@ async def fetch_and_show_groups(callback: types.CallbackQuery, user_id: int):
         state = get_user_state(user_id)
         selected = state.get("selected_groups", [])
         
-        kb = groups_selection_keyboard(selected, dialogs)
+        kb = groups_selection_keyboard(selected, dialogs, state.get("group_page", 0))
         await callback.message.edit_text("📋 Выберите группы для рассылки:", reply_markup=kb)
     except Exception as e:
         logger.error(f"Error fetching groups: {e}")
@@ -390,7 +489,7 @@ async def cb_toggle_group(callback: types.CallbackQuery):
     # Reconstruct dummy objects for keyboard func
     dialogs = [type('obj', (object,), {'id': g['id'], 'title': g['title']}) for g in group_data]
     
-    kb = groups_selection_keyboard(selected, dialogs)
+    kb = groups_selection_keyboard(selected, dialogs, state.get("group_page", 0))
     await callback.message.edit_reply_markup(reply_markup=kb)
     await callback.answer()
 
@@ -407,8 +506,30 @@ async def cb_select_all_groups(callback: types.CallbackQuery):
     set_user_state(user_id, state)
     
     dialogs = [type('obj', (object,), {'id': g['id'], 'title': g['title']}) for g in group_data]
-    kb = groups_selection_keyboard(all_ids, dialogs)
+    kb = groups_selection_keyboard(all_ids, dialogs, state.get("group_page", 0))
     await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("groups_page:"))
+async def cb_groups_page(callback: types.CallbackQuery):
+    page = int(callback.data.split(":", 1)[1])
+    user_id = callback.from_user.id
+    state = get_user_state(user_id)
+    state["group_page"] = page
+    set_user_state(user_id, state)
+    ensure_redis()
+    group_data_json = redis.get(f"broadcast:groups:{user_id}")
+    group_data = json.loads(group_data_json) if group_data_json else []
+    dialogs = [type('obj', (object,), {'id': group['id'], 'title': group['title']}) for group in group_data]
+    await callback.message.edit_reply_markup(
+        reply_markup=groups_selection_keyboard(state.get("selected_groups", []), dialogs, page)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "ignore")
+async def cb_ignore(callback: types.CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "continue_to_send")
@@ -417,6 +538,13 @@ async def cb_continue_to_send(callback: types.CallbackQuery):
     state = get_user_state(user_id)
     if not state.get("selected_groups"):
         await callback.answer("Выберите хотя бы одну группу.", show_alert=True)
+        return
+
+    if state.get("step") == "selecting_group_list_channels":
+        state["step"] = "waiting_for_group_list_name"
+        set_user_state(user_id, state)
+        await callback.message.edit_text("Введите название списка каналов:", reply_markup=cancel_keyboard())
+        await callback.answer()
         return
     
     await callback.message.edit_text("Как отправить сообщение?", reply_markup=send_decision_keyboard())
@@ -491,22 +619,135 @@ async def cb_cancel(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "templates")
 async def cb_templates(callback: types.CallbackQuery):
-    await callback.message.edit_text("Функционал шаблонов в разработке (демо).", reply_markup=main_menu_keyboard())
+    templates = get_user_templates(callback.from_user.id)
+    kb = [[InlineKeyboardButton(text="➕ Создать шаблон", callback_data="create_template")]]
+    kb.extend([InlineKeyboardButton(text=f"📝 {item['name']}", callback_data=f"manage_template:{item['id']}")] for item in templates)
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
+    await callback.message.edit_text("📚 Шаблоны сообщений:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "create_template")
+async def cb_create_template(callback: types.CallbackQuery):
+    set_user_state(callback.from_user.id, {"step": "waiting_for_template_name"})
+    await callback.message.edit_text("Введите название шаблона:", reply_markup=cancel_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("manage_template:"))
+async def cb_manage_template(callback: types.CallbackQuery):
+    template_id = callback.data.split(":", 1)[1]
+    template = next((item for item in get_user_templates(callback.from_user.id) if item["id"] == template_id), None)
+    if not template:
+        await callback.answer("Шаблон не найден.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_template:{template_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="templates")],
+    ])
+    await callback.message.edit_text(f"📝 <b>{template['name']}</b>\n\n{template['message']}", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("delete_template:"))
+async def cb_delete_template(callback: types.CallbackQuery):
+    template_id = callback.data.split(":", 1)[1]
+    templates = [item for item in get_user_templates(callback.from_user.id) if item["id"] != template_id]
+    save_user_templates(callback.from_user.id, templates)
+    await cb_templates(callback)
 
 @dp.callback_query(lambda c: c.data == "tasks")
 async def cb_tasks(callback: types.CallbackQuery):
-    await callback.message.edit_text("Функционал таймеров в разработке (демо).", reply_markup=main_menu_keyboard())
+    tasks = get_user_tasks(callback.from_user.id)
+    kb = []
+    for task in tasks:
+        status = {"active": "🟢", "completed": "✅", "error": "❌", "cancelled": "🚫"}.get(task.get("status"), "⚪")
+        kb.append([InlineKeyboardButton(
+            text=f"{status} {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)} · {task.get('interval_minutes', 1)} мин",
+            callback_data=f"task_details:{task['task_id']}",
+        )])
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
+    await callback.message.edit_text("📊 Мои таймеры:" if tasks else "📊 Активных или сохранённых таймеров нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("task_details:"))
+async def cb_task_details(callback: types.CallbackQuery):
+    task_id = callback.data.split(":", 1)[1]
+    task = get_task(task_id)
+    if not task or task.get("user_id") != callback.from_user.id:
+        await callback.answer("Таймер не найден.", show_alert=True)
+        return
+    kb = []
+    if task.get("status") == "active":
+        kb.append([InlineKeyboardButton(text="🚫 Отменить таймер", callback_data=f"cancel_task:{task_id}")])
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="tasks")])
+    await callback.message.edit_text(
+        f"⏰ Таймер {task_id[:8]}\nСтатус: {task.get('status')}\n"
+        f"Интервал: {task.get('interval_minutes', 1)} мин.\n"
+        f"Повторы: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)}\n"
+        f"Каналов: {len(task.get('groups', []))}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("cancel_task:"))
+async def cb_cancel_task(callback: types.CallbackQuery):
+    task_id = callback.data.split(":", 1)[1]
+    task = get_task(task_id)
+    if not task or task.get("user_id") != callback.from_user.id:
+        await callback.answer("Таймер не найден.", show_alert=True)
+        return
+    task["status"] = "cancelled"
+    save_task(task_id, task)
+    await callback.answer("Таймер отменён.")
+    await cb_tasks(callback)
 
 @dp.callback_query(lambda c: c.data == "groups")
 async def cb_groups(callback: types.CallbackQuery):
-    await callback.message.edit_text("Список ваших групп доступен при создании рассылки.", reply_markup=main_menu_keyboard())
+    group_lists = get_group_lists(callback.from_user.id)
+    kb = [[InlineKeyboardButton(text="➕ Создать список", callback_data="create_group_list")]]
+    kb.extend([InlineKeyboardButton(text=f"📋 {item['name']} ({len(item['groups'])})", callback_data=f"manage_group_list:{item['id']}")] for item in group_lists)
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
+    await callback.message.edit_text("📋 Списки каналов для рассылки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "create_group_list")
+async def cb_create_group_list(callback: types.CallbackQuery):
+    set_user_state(callback.from_user.id, {"step": "selecting_group_list_channels", "selected_groups": []})
+    await fetch_and_show_groups(callback, callback.from_user.id)
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("manage_group_list:"))
+async def cb_manage_group_list(callback: types.CallbackQuery):
+    list_id = callback.data.split(":", 1)[1]
+    group_list = next((item for item in get_group_lists(callback.from_user.id) if item["id"] == list_id), None)
+    if not group_list:
+        await callback.answer("Список не найден.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить список", callback_data=f"delete_group_list:{list_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="groups")],
+    ])
+    await callback.message.edit_text(f"📋 <b>{group_list['name']}</b>\nКаналов в списке: {len(group_list['groups'])}", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("delete_group_list:"))
+async def cb_delete_group_list(callback: types.CallbackQuery):
+    list_id = callback.data.split(":", 1)[1]
+    save_group_lists(callback.from_user.id, [item for item in get_group_lists(callback.from_user.id) if item["id"] != list_id])
+    await cb_groups(callback)
 
 @dp.callback_query(lambda c: c.data == "settings")
 async def cb_settings(callback: types.CallbackQuery):
-    await callback.message.edit_text("Настройки в разработке.", reply_markup=main_menu_keyboard())
+    await callback.message.edit_text(
+        "⚙️ Настройки\n\nДля работы бота должны быть заданы BOT_TOKEN, API_ID, API_HASH, TELEGRAM_SESSION_STRING, Upstash Redis и QStash.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")]]),
+    )
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "back_broadcast")
@@ -567,30 +808,15 @@ async def handle_message(message: types.Message):
         
         set_user_state(user_id, {"step": "selecting_groups", "message_text": safe_text, "selected_groups": []})
         
-        # Fetch groups
-        try:
-            client = await get_telethon_client()
-            dialogs = []
-            async for dialog in client.iter_dialogs():
-                if dialog.is_group or dialog.is_channel:
-                    dialogs.append(dialog)
-            await client.disconnect()
-            
-            group_data = [{"id": str(d.id), "title": d.name} for d in dialogs]
-            ensure_redis()
-            redis.set(f"broadcast:groups:{user_id}", json.dumps(group_data))
-            
-            kb = groups_selection_keyboard([], dialogs)
-            await message.answer("📋 Выберите группы для рассылки:", reply_markup=kb)
-        except Exception as e:
-            logger.error(f"Error fetching groups: {e}")
-            await message.answer("Ошибка получения групп.")
-            clear_user_state(user_id)
+        await message.answer("Выберите источник каналов:", reply_markup=group_source_keyboard())
     else:
         await message.answer("Неизвестная команда. Нажмите /start")
 
 # --- FastAPI App ---
-app = FastAPI(title="Telegram Broadcast Bot")
+# Keep the constructor assignment simple: Vercel discovers FastAPI entry points
+# statically and expects a module-level ``app = FastAPI()`` declaration.
+app = FastAPI()
+app.title = "Telegram Broadcast Bot"
 
 @app.get("/")
 async def root():
