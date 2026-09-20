@@ -671,10 +671,11 @@ async def cb_tasks(callback: types.CallbackQuery):
     kb = []
     for task in tasks:
         status = {"active": "🟢", "completed": "✅", "error": "❌", "cancelled": "🚫"}.get(task.get("status"), "⚪")
-        kb.append([InlineKeyboardButton(
-            text=f"{status} {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)} · {task.get('interval_minutes', 1)} мин",
-            callback_data=f"task_details:{task['task_id']}",
-        )])
+        task_name = f"{status} Таймер: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)} повторов"
+        # Добавляем две кнопки для каждого таймера: одна для деталей, вторая для быстрой отмены (если активен)
+        kb.append([InlineKeyboardButton(text=task_name, callback_data=f"task_details:{task['task_id']}")])
+        if task.get("status") == "active":
+            kb.append([InlineKeyboardButton(text="  🚫 Отменить этот таймер", callback_data=f"cancel_task:{task['task_id']}")])
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
     await callback.message.edit_text("📊 Мои таймеры:" if tasks else "📊 Активных или сохранённых таймеров нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await callback.answer()
