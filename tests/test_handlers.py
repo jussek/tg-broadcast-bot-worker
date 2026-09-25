@@ -147,8 +147,12 @@ def test_active_timer_can_be_cancelled(monkeypatch):
     monkeypatch.setattr(index, "cb_tasks", fake_tasks_handler)
     asyncio.run(index.cb_cancel_task(callback))
 
-    assert saved_tasks == [("task-1", {"task_id": "task-1", "user_id": 42, "status": "cancelled"})]
-    assert callback.answers[0][0] == "Таймер отменён."
+    assert len(saved_tasks) == 1
+    task_id, saved = saved_tasks[0]
+    assert task_id == "task-1"
+    assert saved["status"] == "cancelled"
+    assert saved["user_id"] == 42
+    assert callback.answers[0][0] == "✅ Таймер отменён, рассылка остановлена."
 
 
 def test_scheduled_task_records_next_run(monkeypatch):
