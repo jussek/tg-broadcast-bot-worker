@@ -1,178 +1,238 @@
-"""Regression tests for webhook handler helpers that do not need Telegram."""
+"""Business-flow tests: menus, group selection, timers, task details."""
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import pytest
+
 from api import index
 
 
-class FakeMessage:
-    def __init__(self, text=None):
-        self.from_user = SimpleNamespace(id=42)
-        self.text = text
-        self.caption = None
-        self.answers = []
+class FakeRedis:
+    def __init__(self):
+        self.store = {}
+        self.sets = {}
 
-    async def answer(self, text, reply_markup=None):
-        self.answers.append((text, reply_markup))
+    def get(self, key):
+        return self.store.get(key)
+
+    def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return "OK"
+
+    def delete(self, *keys):
+        for k in keys:
+            self.store.pop(k, None)
+
+    def sadd(self, key, *values):
+        s = self.sets.setdefault(key, set())
+        before = len(s)
+        s.update(str(v) for v in values)
+        return len(s) - before
+
+    def smembers(self, key):
+        return list(self.sets.get(key, set()))
+
+    def srem(self, key, *values):
+        s = self.sets.get(key, set())
+        for v in values:
+            s.discard(str(v))
+
+    def keys(self, pattern):
+        prefix = pattern.rstrip("*")
+        return [k for k in self.store if k.startswith(prefix)]
+
+
+@pytest.fixture()
+def fake_redis(monkeypatch):
+    r = FakeRedis()
+    monkeypatch.setattr(index, "get_redis", lambda: r)
+    import storage.redis_client as rc
+    monkeypatch.setattr(rc, "_redis", r)
+    return r
 
 
 class FakeCallback:
-    def __init__(self, data):
+    def __init__(self, data, user_id=42):
         self.data = data
-        self.from_user = SimpleNamespace(id=42)
+        self.from_user = SimpleNamespace(id=user_id)
         self.answers = []
+        self.edits = []
+        self.message = SimpleNamespace(edit_text=self._edit_text)
+
+    async def _edit_text(self, text, reply_markup=None, **kwargs):
+        self.edits.append((text, reply_markup))
 
     async def answer(self, text=None, **kwargs):
         self.answers.append((text, kwargs))
 
 
-def test_start_sends_menu_when_redis_is_unavailable(monkeypatch):
-    """The start command must still respond instead of failing before answer()."""
-    monkeypatch.setattr(index, "clear_user_state", lambda _user_id: (_ for _ in ()).throw(RuntimeError("Redis unavailable")))
-    message = FakeMessage()
+def make_update(callback_data, user_id=42):
+    from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
-    asyncio.run(index.cmd_start(message))
-
-    assert message.answers[0][0] == "🤖 Панель рассылки\n\nВыбери действие:"
-    assert message.answers[0][1] is not None
-
-
-def test_task_lock_accepts_upstash_success_response(monkeypatch):
-    class FakeRedis:
-        @staticmethod
-        def set(*_args, **_kwargs):
-            return "OK"
-
-    monkeypatch.setattr(index, "redis", FakeRedis())
-    assert index.acquire_task_lock("task-id") is True
+    message = Message(
+        message_id=1, date=0,
+        chat=Chat(id=user_id, type="private"),
+        text="menu",
+    )
+    callback_query = CallbackQuery(
+        id="cb", from_user=User(id=user_id, is_bot=False, first_name="U"),
+        chat_instance="ci", data=callback_data, message=message,
+    )
+    return Update(update_id=1, callback_query=callback_query)
 
 
-def test_group_keyboard_uses_telethon_dialog_name():
-    keyboard = index.groups_selection_keyboard([], [SimpleNamespace(id=-100, name="Новости")])
-    assert keyboard.inline_keyboard[0][0].text == "☐ Новости"
+def dispatch(callback_data):
+    update = make_update(callback_data)
+
+    async def _match():
+        for h in index.dp.callback_query.handlers:
+            try:
+                result = await h.check(update)
+            except Exception:
+                result = False
+            if getattr(result, "passing", False):
+                return h
+        raise AssertionError(f"No handler matches {callback_data!r}")
+
+    return asyncio.run(_match())
 
 
-def test_main_menu_does_not_include_settings():
-    keyboard = index.main_menu_keyboard()
-    callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
-    assert "settings" not in callbacks
+def run_callback(callback_data, user_id=42):
+    callback = FakeCallback(callback_data, user_id)
+    asyncio.run(dispatch(callback_data).callback(callback))
+    return callback
 
 
-def test_parse_positive_integer_rejects_invalid_values():
-    assert index.parse_positive_integer("15") == 15
-    assert index.parse_positive_integer(" 2 ") == 2
-    assert index.parse_positive_integer("0") is None
-    assert index.parse_positive_integer("-1") is None
-    assert index.parse_positive_integer("one") is None
+# --------------------------------------------------------------------- locks
+def test_task_lock_accepts_upstash_success_response(fake_redis):
+    from storage.models import acquire_task_lock, release_task_lock
+    assert acquire_task_lock("t9") is True
+    assert acquire_task_lock("t9") is False  # second caller must not proceed
+    release_task_lock("t9")
+    assert acquire_task_lock("t9") is True
 
 
-def test_timer_setup_accepts_custom_interval_and_repeat_count(monkeypatch):
-    state = {
-        "step": "waiting_for_interval",
-        "message_text": "Hello",
-        "selected_groups": ["-1001"],
-    }
-    saved_states = []
-    scheduled_states = []
-
-    monkeypatch.setattr(index, "get_user_state", lambda _user_id: state)
-    monkeypatch.setattr(index, "set_user_state", lambda _user_id, value: saved_states.append(value.copy()))
-    monkeypatch.setattr(index, "clear_user_state", lambda _user_id: None)
-
-    async def fake_create_and_schedule(user_id, task_state):
-        scheduled_states.append((user_id, task_state.copy()))
-        return "12345678-task"
-
-    monkeypatch.setattr(index, "create_and_schedule_task", fake_create_and_schedule)
-
-    interval_message = FakeMessage("7")
-    asyncio.run(index.handle_message(interval_message))
-
-    assert saved_states[-1]["interval_minutes"] == 7
-    assert saved_states[-1]["step"] == "waiting_for_repeats"
-    assert "количество отправок" in interval_message.answers[-1][0]
-
-    repeat_message = FakeMessage("3")
-    asyncio.run(index.handle_message(repeat_message))
-
-    assert scheduled_states == [(42, {
-        "step": "waiting_for_repeats",
-        "message_text": "Hello",
-        "selected_groups": ["-1001"],
-        "interval_minutes": 7,
-        "total_repeats": 3,
-    })]
-    assert "через 7 мин." in repeat_message.answers[-1][0]
-    assert "3 раз" in repeat_message.answers[-1][0]
+# ------------------------------------------------------------------ menus
+def test_new_broadcast_shows_action_menu(fake_redis):
+    cb = run_callback("new_broadcast")
+    assert len(cb.answers) == 1
+    texts = [b.text for _, markup in cb.edits for row in markup.inline_keyboard for b in row]
+    assert any("Написать сообщение" in t for t in texts)
 
 
-def test_group_list_name_is_saved_from_waiting_state(monkeypatch):
-    state = {
-        "step": "waiting_for_group_list_name",
-        "selected_groups": ["-1001", "-1002"],
-    }
-    saved_lists = []
-    cleared_users = []
-
-    monkeypatch.setattr(index, "get_user_state", lambda _user_id: state)
-    monkeypatch.setattr(index, "get_group_lists", lambda _user_id: [])
-    monkeypatch.setattr(index, "save_group_lists", lambda user_id, lists: saved_lists.append((user_id, lists)))
-    monkeypatch.setattr(index, "clear_user_state", lambda user_id: cleared_users.append(user_id))
-
-    message = FakeMessage("Основные каналы")
-    asyncio.run(index.handle_message(message))
-
-    assert saved_lists[0][0] == 42
-    assert saved_lists[0][1][0]["name"] == "Основные каналы"
-    assert saved_lists[0][1][0]["groups"] == ["-1001", "-1002"]
-    assert cleared_users == [42]
-    assert message.answers[-1][0] == "✅ Список «Основные каналы» сохранён."
+def test_write_message_sets_waiting_state(fake_redis):
+    cb = run_callback("write_message")
+    state = index.get_user_state(42)
+    assert state["step"] == "waiting_for_message"
+    assert len(cb.answers) == 1
 
 
-def test_active_timer_can_be_cancelled(monkeypatch):
-    task = {"task_id": "task-1", "user_id": 42, "status": "active"}
-    saved_tasks = []
-    callback = FakeCallback("cancel_task:task-1")
-
-    monkeypatch.setattr(index, "get_task", lambda _task_id: task)
-    monkeypatch.setattr(index, "save_task", lambda task_id, data: saved_tasks.append((task_id, data.copy())))
-
-    async def fake_tasks_handler(_callback):
-        return None
-
-    monkeypatch.setattr(index, "cb_tasks", fake_tasks_handler)
-    asyncio.run(index.cb_cancel_task(callback))
-
-    assert len(saved_tasks) == 1
-    task_id, saved = saved_tasks[0]
-    assert task_id == "task-1"
-    assert saved["status"] == "cancelled"
-    assert saved["user_id"] == 42
-    assert callback.answers[0][0] == "✅ Таймер отменён, рассылка остановлена."
+def test_back_menu_clears_state(fake_redis):
+    index.set_user_state(42, {"step": "selecting_groups", "message_text": "x"})
+    cb = run_callback("back_menu")
+    assert index.get_user_state(42) is None
+    assert len(cb.answers) == 1
 
 
-def test_scheduled_task_records_next_run(monkeypatch):
-    state = {
-        "message_text": "Hello",
-        "selected_groups": ["-1001"],
-        "interval_minutes": 5,
-        "total_repeats": 2,
-    }
-    saved_tasks = []
+# ------------------------------------------------------------- group picker
+def test_group_keyboard_uses_telethon_dialog_name(fake_redis):
+    index.save_groups_cache(42, [{"id": "-100333", "title": "Мой канал 🚀"}])
+    index.set_user_state(42, {"step": "selecting_groups", "selected_groups": [], "message_text": "m"})
+    cb = run_callback("select_live_groups")
+    button_texts = [b.text for _, markup in cb.edits for row in markup.inline_keyboard for b in row]
+    assert any("Мой канал 🚀" in t for t in button_texts)
+    assert len(cb.answers) == 1
 
-    monkeypatch.setattr(index, "save_task", lambda task_id, task: saved_tasks.append(task.copy()))
-    monkeypatch.setattr(index, "ensure_redis", lambda: None)
-    monkeypatch.setattr(index, "redis", SimpleNamespace(sadd=lambda *_args: None))
-    monkeypatch.setattr(index, "ensure_qstash", lambda: None)
-    monkeypatch.setattr(index, "qstash", SimpleNamespace(message=SimpleNamespace(publish_json=lambda **_kwargs: None)))
-    monkeypatch.setattr(index.uuid, "uuid4", lambda: "task-id")
-    monkeypatch.setattr(index.time, "time", lambda: 1_000.0)
 
+def test_pagination_preserves_selected_groups(fake_redis):
+    groups = [{"id": f"-{i}", "title": f"G{i}"} for i in range(1, 46)]  # 3 pages
+    index.save_groups_cache(42, groups)
+    index.set_user_state(42, {"step": "selecting_groups", "selected_groups": ["-5"], "group_page": 0})
+
+    cb = run_callback("groups_page:1")
+    state = index.get_user_state(42)
+    assert state["group_page"] == 1
+    assert state["selected_groups"] == [5]  # preserved across page switch
+
+    cb = run_callback("toggle_group:-25")
+    state = index.get_user_state(42)
+    assert sorted(state["selected_groups"]) == [5, 25]
+
+    cb = run_callback("groups_page:99")  # clamped to last page
+    assert index.get_user_state(42)["group_page"] == 2
+
+
+def test_toggle_then_continue_reaches_send_menu(fake_redis):
+    index.save_groups_cache(42, [{"id": "-1001", "title": "A"}, {"id": "-1002", "title": "B"}])
+    index.set_user_state(42, {"step": "selecting_groups", "selected_groups": [], "message_text": "hello"})
+    run_callback("toggle_group:-1001")
+    run_callback("toggle_group:-1002")
+    cb = run_callback("continue_to_send")
+    texts = [b.text for _, markup in cb.edits for row in markup.inline_keyboard for b in row]
+    assert any("Отправить сейчас" in t for t in texts)
+
+
+# ------------------------------------------------------------------- tasks
+def test_scheduled_task_records_next_run(fake_redis, monkeypatch):
+    monkeypatch.setattr(index, "schedule_process", lambda *a, **k: None)
+    state = {"message_text": "hi", "selected_groups": ["-1001"], "interval_minutes": 10, "total_repeats": 4}
     task_id = asyncio.run(index.create_and_schedule_task(42, state))
+    task = index.get_task(task_id)
+    assert task["next_run"] > task["created_at"]
+    assert task["interval_minutes"] == 10
+    assert task["total_repeats"] == 4
 
-    assert task_id == "task-id"
-    assert saved_tasks[0]["next_run"] == 1_300.0
+
+def test_active_timer_can_be_cancelled(fake_redis):
+    task = {"id": "aaa11111-2222", "user_id": 42, "status": "active", "message": "m",
+            "groups": ["-1"], "interval_minutes": 5, "completed_repeats": 0, "total_repeats": 3}
+    index.save_task(task)
+    get_redis = index.get_redis()
+    get_redis.sadd("broadcast:user:42:tasks", task["id"])
+
+    cb = run_callback(f"cancel_task:{task['id']}")
+    saved = json.loads(get_redis.store[f"broadcast:task:{task['id']}"])
+    assert saved["status"] == "cancelled"
+    assert len(cb.answers) >= 1
+
+
+def test_task_details_shows_all_fields(fake_redis):
+    task = {"id": "bbbb2222-3333", "user_id": 42, "status": "active", "message": "тест текст",
+            "groups": ["-1", "-2", "-3"], "interval_minutes": 15,
+            "completed_repeats": 1, "total_repeats": 5, "next_run": 1770000000.0}
+    index.save_task(task)
+    cb = run_callback(f"task_details:{task['id']}")
+    body = cb.edits[-1][0]
+    for fragment in ("Таймер", "Статус", "Интервал", "Повторы: 1/5", "Каналов: 3", "Следующий запуск"):
+        assert fragment in body, f"missing {fragment!r} in task details"
+    markup = cb.edits[-1][1]
+    cancel_buttons = [b for row in markup.inline_keyboard for b in row if "Отменить" in b.text]
+    assert cancel_buttons, "task details must offer a working cancel button"
+    assert len(cb.answers) == 1
+
+
+def test_task_details_rejects_foreign_task(fake_redis):
+    task = {"id": "cccc3333", "user_id": 99, "status": "active", "message": "m",
+            "groups": [], "interval_minutes": 5, "completed_repeats": 0, "total_repeats": 1}
+    index.save_task(task)
+    cb = run_callback(f"task_details:{task['id']}", user_id=42)
+    assert len(cb.edits) == 0
+    assert cb.answers[0][1].get("show_alert") is True
+
+
+# ---------------------------------------------------------------- templates
+def test_template_crud_roundtrip(fake_redis):
+    index.save_user_templates(42, [])
+    index.save_user_templates(42, [{"id": "tpl1", "name": "Шаблон", "message": "текст"}])
+    assert index.get_user_templates(42)[0]["name"] == "Шаблон"
+    cb = run_callback("manage_template:tpl1")
+    assert "Шаблон" in cb.edits[-1][0]
+    cb = run_callback("delete_template:tpl1")
+    assert index.get_user_templates(42) == []

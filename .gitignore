@@ -1,41 +1,6 @@
-```gitignore
-# Python cache files
+# Compiled and build artifacts
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
 
-# Dependencies
-.venv/
-venv/
-env/
-requirements.txt.bak
-
-# Logs
-*.log
-
-# Environment variables
+# Environment
 .env
-.env.local
-*.env.*
-
-# Coverage reports
-.coverage
-htmlcov/
-coverage/
-
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS generated files
-.DS_Store
-Thumbs.db
-
-# Build artifacts
-dist/
-build/
-*.egg-info/
-```
