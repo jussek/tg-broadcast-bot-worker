@@ -47,16 +47,19 @@ def make_update(callback_data, user_id=42):
 
 
 def matching_handlers(callback_data):
+    """Resolve handlers exactly like the Dispatcher does: filters are checked
+    against the CallbackQuery object (Update.callback_query), not the Update."""
     update = make_update(callback_data)
+    callback_query = update.callback_query
 
     async def _match():
         matched = []
         for h in index.dp.callback_query.handlers:
             try:
-                result = await h.check(update)
+                passing, _kwargs = await h.check(callback_query)
             except Exception:
-                result = False
-            if getattr(result, "passing", False):
+                passing = False
+            if passing:
                 matched.append(h)
         return matched
 
