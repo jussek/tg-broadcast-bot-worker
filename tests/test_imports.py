@@ -2,19 +2,21 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / 'api'))
 
 
 def test_api_index_imports_without_env():
     """Cold-start safety: module import must not touch the network or crash."""
-    from api.index import app, dp
+    from index import app, dp
     assert app is not None
     assert dp is not None
 
 
 def test_single_dispatcher_and_no_bot_at_import():
     """There must be exactly one Dispatcher and no Bot created at import time."""
-    from api import index
+    import index
     assert index.dp is index.Dispatcher.__subclasses__()[0].__new__ if False else True
     # The webhook endpoint feeds updates into the same dispatcher that owns handlers.
     handler_callbacks = [h.callback for h in index.dp.callback_query.handlers]
