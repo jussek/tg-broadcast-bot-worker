@@ -1422,6 +1422,50 @@ async def _call_set_webhook_info() -> Dict[str, Any]:
     }
 
 
+@app.post("/api/admin/cancel-task")
+async def admin_cancel_task(
+    request: Request,
+    x_setup_secret: Optional[str] = Header(None, alias="X-Setup-Secret"),
+):
+    """Secret-protected maintenance endpoint: force-cancel one or more tasks.
+
+    Body: {"task_ids": ["09f58875", ...]}  (full or prefix of task id).
+    Marks tasks cancelled in Redis and removes them from the user's index so
+    they disappear from "Мои таймеры" immediately.
+    """
+    if not WEBHOOK_SETUP_SECRET or x_setup_secret != WEBHOOK_SETUP_SECRET:
+        raise HTTPException(status_code=403, detail="Missing or invalid X-Setup-Secret header")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    raw_ids = body.get("task_ids") or ([body["task_id"]] if body.get("task_id") else [])
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(status_code=400, detail="Provide \"task_ids\": [...] or \"task_id\"")
+
+    redis = get_redis()
+    all_keys = redis.keys("broadcast:task:*") or []
+    results = {}
+    for raw in raw_ids:
+        raw = str(raw).strip()
+        matched = [k for k in all_keys if k.split("broadcast:task:", 1)[1].startswith(raw)]
+        if not matched:
+            results[raw] = "not_found"
+            continue
+        for key in matched:
+            task_id = key.split("broadcast:task:", 1)[1]
+            task = _safe_loads(redis.get(key), default=None)
+            if not task:
+                continue
+            task["status"] = "cancelled"
+            redis.set(key, json.dumps(task, ensure_ascii=False))
+            user_id = task.get("user_id")
+            if user_id is not None:
+                redis.srem(f"broadcast:user:{user_id}:tasks", task_id)
+        results[task_id] = "cancelled"
+    return {"status": "ok", "results": results}
+
+
 @app.post("/api/delete-webhook")
 async def delete_webhook(x_setup_secret: Optional[str] = Header(None, alias="X-Setup-Secret")):
     if not WEBHOOK_SETUP_SECRET or x_setup_secret != WEBHOOK_SETUP_SECRET:
