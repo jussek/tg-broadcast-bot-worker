@@ -695,30 +695,40 @@ def _format_task_details(task: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+ACTIVE_TASK_STATUSES = ("active", "pending")
+
+
 @dp.callback_query(lambda c: c.data == "tasks")
 async def cb_tasks(callback: types.CallbackQuery):
-    tasks = get_user_tasks(callback.from_user.id)
-    active_count = sum(1 for t in tasks if t.get("status") in ("active", "pending"))
-    header_lines = ["📊 <b>Мои таймеры</b>"]
+    all_tasks = get_user_tasks(callback.from_user.id)
+    # Показываем только действующие таймеры (активные и в очереди)
+    tasks = [t for t in all_tasks if t.get("status") in ACTIVE_TASK_STATUSES]
+    finished_count = len(all_tasks) - len(tasks)
+    header_lines = ["📊 <b>Действующие таймеры</b>"]
     if not tasks:
-        header_lines.append("\nУ вас пока нет таймеров. Создайте новый через «📨 Новая рассылка» → «⏰ Задать таймер».")
+        header_lines.append("\nУ вас нет действующих таймеров. Создайте новый через «📨 Новая рассылка» → «⏰ Задать таймер».")
+        if finished_count:
+            header_lines.append(f"Завершённых и отменённых таймеров в истории: {finished_count} (скрыты).")
     else:
-        header_lines.append(f"\nВсего: {len(tasks)}, активных: {active_count}\n")
+        header_lines.append(f"\nДействующих: {len(tasks)}\n")
         for i, task in enumerate(tasks, 1):
             tid = str(task.get("task_id") or task.get("id") or "?")[:8]
-            status = {"active": "🟢", "pending": "🟡", "completed": "✅", "error": "❌", "failed": "❌", "cancelled": "🚫"}.get(task.get("status"), "⚪")
+            status = {"active": "🟢", "pending": "🟡"}.get(task.get("status"), "⚪")
             header_lines.append(
                 f"{i}. {status} {tid} — {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)} повторов, "
                 f"интервал {task.get('interval_minutes', 1)} мин."
             )
+        if finished_count:
+            header_lines.append(f"\nСкрыто завершённых и отменённых таймеров: {finished_count}.")
     kb = []
     for task in tasks:
         task_id = task.get("task_id") or task.get("id")
         if not task_id:
             continue
-        row = [InlineKeyboardButton(text=f"ℹ️ {str(task_id)[:8]}", callback_data=f"task_details:{task_id}")]
-        if task.get("status") in ("active", "pending"):
-            row.append(InlineKeyboardButton(text="🚫 Отменить", callback_data=f"cancel_task:{task_id}"))
+        row = [
+            InlineKeyboardButton(text=f"ℹ️ {str(task_id)[:8]}", callback_data=f"task_details:{task_id}"),
+            InlineKeyboardButton(text="🚫 Отменить", callback_data=f"cancel_task:{task_id}"),
+        ]
         kb.append(row)
     kb.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data="tasks")])
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
