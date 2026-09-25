@@ -229,14 +229,24 @@ class SessionNotAuthorizedError(RuntimeError):
     """Telethon session exists but is not authorized for a user account."""
 
 
-async def get_telethon_client() -> TelegramClient:
-    """Create a connected, authorized Telethon client for this invocation."""
-    api_id = int(_require_env(API_ID, "API_ID"))
-    api_hash = _require_env(API_HASH, "API_HASH")
-    session = _require_env(TELEGRAM_SESSION_STRING, "TELEGRAM_SESSION_STRING")
+def get_telethon_client_factory():
+    """Construct a (not yet connected) TelegramClient for this invocation.
 
-    session_obj = StringSession(session)
-    client = TelegramClient(session_obj, api_id, api_hash)
+    Env vars are re-read on every call so tests and credential rotations take
+    effect without re-importing the module.  Split out from connecting so the
+    lifecycle (connect / authorize / disconnect) is independently testable.
+    """
+    api_id = int(_require_env(os.getenv("API_ID") or API_ID, "API_ID"))
+    api_hash = _require_env(os.getenv("API_HASH") or API_HASH, "API_HASH")
+    session = _require_env(
+        os.getenv("TELEGRAM_SESSION_STRING") or TELEGRAM_SESSION_STRING,
+        "TELEGRAM_SESSION_STRING",
+    )
+    return TelegramClient(StringSession(session), api_id, api_hash)
+
+
+async def connect_authorized_client(client: TelegramClient) -> TelegramClient:
+    """Connect a client and verify it belongs to an authorized account."""
     try:
         await client.connect()
         if not await client.is_user_authorized():
@@ -251,6 +261,11 @@ async def get_telethon_client() -> TelegramClient:
             logger.exception("Failed to disconnect Telethon client after error")
         raise
     return client
+
+
+async def get_telethon_client() -> TelegramClient:
+    """Create a connected, authorized Telethon client for this invocation."""
+    return await connect_authorized_client(get_telethon_client_factory())
 
 
 async def fetch_user_dialogs(client: TelegramClient) -> List[Dict[str, str]]:
@@ -859,8 +874,12 @@ async def cb_cancel(callback: types.CallbackQuery):
 # ============================================================================
 @dp.callback_query(F.data == "templates")
 async def cb_templates(callback: types.CallbackQuery):
-    await render_templates(callback)
-    await safe_answer(callback)
+    try:
+        await render_templates(callback)
+        await safe_answer(callback)
+    except Exception:
+        logger.exception("Callback failed: %s", callback.data)
+        await safe_answer(callback, "❌ Произошла ошибка. Попробуйте ещё раз.", show_alert=True)
 
 
 async def render_templates(callback: types.CallbackQuery):
