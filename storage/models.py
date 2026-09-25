@@ -5,7 +5,18 @@ import uuid
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, asdict
 
-from .redis_client import get_redis
+from . import redis_client
+
+
+def get_redis():
+    """Resolve the Redis client at call time.
+
+    Importing ``get_redis`` by value would freeze a reference to the module
+    function and bypass clients injected later via ``set_redis`` (tests do
+    exactly that).  This thin wrapper keeps a single storage layer with lazy
+    resolution.
+    """
+    return redis_client.get_redis()
 
 
 # ============================================================================
