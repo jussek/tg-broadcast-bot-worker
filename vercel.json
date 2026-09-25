@@ -9,8 +9,5 @@
       "includeFiles": "{storage,services,bot}/**"
     }
   },
-  "cleanCache": true,
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/api/index" }
-  ]
+  "cleanCache": true
 }
