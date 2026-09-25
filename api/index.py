@@ -1439,6 +1439,7 @@ async def process_task(request: Request):
     # we dedupe on it first.  Additionally we lock per (task, repeat) so even
     # legacy publishers without a Message-Id cannot send the same repeat twice.
     message_id = request.headers.get("Message-Id") or request.headers.get("message-id")
+    msg_key = None
     if message_id:
         msg_key = f"broadcast:qstash_message:{message_id}"
         try:
@@ -1464,6 +1465,14 @@ async def process_task(request: Request):
         logger.info("Duplicate QStash delivery for task %s repeat %s ignored", task_id, repeat_no)
         return JSONResponse(content={"ok": True, "status": "duplicate_ignored"})
 
+    def _mark_message_seen():
+        """Record Message-Id as processed (only after the run is committed)."""
+        if msg_key:
+            try:
+                get_redis().set(msg_key, "1", ex=7 * 24 * 3600)
+            except Exception:
+                logger.exception("Failed to mark Message-Id %s as seen", message_id)
+
     if not acquire_task_lock(task_id, seconds=120):
         logger.info("Task %s already processing", task_id)
         return JSONResponse(content={"ok": True, "status": "already_processing"})
@@ -1471,6 +1480,7 @@ async def process_task(request: Request):
     try:
         task = get_task(task_id)
         if not task or task.get("status") not in ACTIVE_TASK_STATUSES:
+            _mark_message_seen()
             return JSONResponse(content={"ok": True, "status": "inactive_or_missing"})
 
         result = await broadcast_message(task.get("groups", []), task.get("message", ""))
@@ -1489,6 +1499,11 @@ async def process_task(request: Request):
                 logger.exception("Unable to reschedule task %s", task_id)
                 task["status"] = "error"
         save_task(task)
+        # The run is committed (repeat counter persisted / task completed), so
+        # this Message-Id must never execute again — record it now.  On an
+        # unexpected error below we deliberately do NOT mark it, letting
+        # QStash retry safely via the per-repeat dedupe key rollback.
+        _mark_message_seen()
 
         # Notify owner about per-send failures (best effort).
         if failures and BOT_TOKEN:
@@ -1515,6 +1530,12 @@ async def process_task(request: Request):
         return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=503)
     except Exception:
         logger.exception("Process error for task %s", task_id)
+        # The run never committed: roll back the per-repeat dedupe key so a
+        # QStash retry (or a new delivery) can attempt this repeat again.
+        try:
+            get_redis().delete(dedupe_key)
+        except Exception:
+            logger.exception("Failed to roll back dedupe key for task %s", task_id)
         raise HTTPException(status_code=500, detail="Task processing failed")
     finally:
         release_task_lock(task_id)
