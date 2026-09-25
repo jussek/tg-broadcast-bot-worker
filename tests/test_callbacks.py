@@ -180,3 +180,85 @@ def test_handler_error_still_answers_with_alert(monkeypatch):
     asyncio.run(handler.callback(callback))
     assert len(callback.answers) == 1
     assert "ошибка" in callback.answers[0][0].lower()
+
+
+# ---------------------------------------------------------------------------
+# Regression: "Мои таймеры" must show ONLY active timers; cancelling a timer
+# from the list must not throw (previously showed "Произошла ошибка").
+# ---------------------------------------------------------------------------
+def _patch_task_store(monkeypatch, tasks):
+    store = {t["id"]: dict(t) for t in tasks}
+
+    def fake_get_user_tasks(uid):
+        return [dict(t) for t in store.values() if int(t.get("user_id", -1)) == int(uid)]
+
+    def fake_get_task(tid):
+        return dict(store[tid]) if tid in store else None
+
+    def fake_save_task(task):
+        store[task["id"]] = dict(task)
+
+    monkeypatch.setattr(index, "get_user_tasks", fake_get_user_tasks)
+    monkeypatch.setattr(index, "get_task", fake_get_task)
+    monkeypatch.setattr(index, "save_task", fake_save_task)
+    return store
+
+
+TASKS_MIXED = [
+    {"id": "act1", "user_id": 42, "status": "active", "interval_minutes": 5,
+     "completed_repeats": 1, "total_repeats": 3, "groups": ["-1"], "message": "hi",
+     "next_run": 1e12, "created_at": 3},
+    {"id": "done1", "user_id": 42, "status": "completed", "interval_minutes": 5,
+     "completed_repeats": 3, "total_repeats": 3, "groups": ["-1"], "message": "hi",
+     "created_at": 2},
+    {"id": "canc1", "user_id": 42, "status": "cancelled", "interval_minutes": 5,
+     "completed_repeats": 0, "total_repeats": 3, "groups": ["-1"], "message": "hi",
+     "created_at": 1},
+]
+
+
+def test_tasks_screen_shows_only_active_timers(monkeypatch):
+    _patch_task_store(monkeypatch, TASKS_MIXED)
+    callback = FakeCallback("tasks")
+    handler = matching_handlers("tasks")[0]
+    asyncio.run(handler.callback(callback))
+
+    assert len(callback.answers) == 1
+    text, markup = callback.edits[-1]
+    button_data = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "task_details:act1" in button_data
+    assert "cancel_task:act1" in button_data
+    assert not any("done1" in d or "canc1" in d for d in button_data if ":" in d)
+    assert "done1" not in text and "canc1" not in text
+    assert "Активных таймеров: 1" in text
+
+
+def test_cancel_task_from_list_does_not_error_and_hides_timer(monkeypatch):
+    _patch_task_store(monkeypatch, TASKS_MIXED)
+    callback = FakeCallback("cancel_task:act1")
+    handler = matching_handlers("cancel_task:act1")[0]
+    asyncio.run(handler.callback(callback))
+
+    assert len(callback.answers) == 1
+    toast = callback.answers[0][0] or ""
+    assert "ошибка" not in toast.lower()
+    assert "Отменён" in toast or "отменён" in toast
+    # The re-rendered list must no longer contain the cancelled timer.
+    _, markup = callback.edits[-1]
+    button_data = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "task_details:act1" not in button_data
+
+
+def test_groups_screen_renders_without_telethon(monkeypatch):
+    monkeypatch.setattr(index, "get_group_lists",
+                        lambda uid: [{"id": "l1", "name": "Список 1", "groups": ["-1", "-2"]}])
+    callback = FakeCallback("groups")
+    handler = matching_handlers("groups")[0]
+    asyncio.run(handler.callback(callback))
+
+    assert len(callback.answers) == 1
+    text, markup = callback.edits[-1]
+    button_data = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "manage_group_list:l1" in button_data
+    assert "create_group_list" in button_data
+    assert "ошибка" not in (callback.answers[0][0] or "").lower()

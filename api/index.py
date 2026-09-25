@@ -367,6 +367,9 @@ dp = Dispatcher(storage=_build_fsm_storage())
 
 ACTIVE_TASK_STATUSES = ("active", "pending")
 
+# Max seconds to wait for Telethon to fetch the dialog list before giving up.
+TELETHON_FETCH_TIMEOUT = float(os.environ.get("TELETHON_FETCH_TIMEOUT", "25"))
+
 
 async def safe_answer(callback: types.CallbackQuery, text: Optional[str] = None, **kwargs):
     """Answer a callback exactly once; never let answering crash a handler."""
@@ -541,13 +544,22 @@ async def show_groups_picker(callback: types.CallbackQuery, user_id: int) -> Non
             return
 
         try:
-            groups = await fetch_user_dialogs(client)
+            groups = await asyncio.wait_for(fetch_user_dialogs(client), timeout=TELETHON_FETCH_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.exception("Telethon dialog fetch timed out for user %s", user_id)
+            await safe_answer(callback, "⛔ Не удалось получить список групп (таймаут). Попробуйте ещё раз.",
+                              show_alert=True)
+            return
         finally:
             try:
                 await client.disconnect()
             except Exception:
                 logger.exception("Telethon disconnect failed")
-        save_groups_cache(user_id, groups)
+        # Never overwrite a good cache with an empty result.
+        if groups:
+            save_groups_cache(user_id, groups)
+        else:
+            groups = []
     else:
         groups = cached
 
@@ -986,18 +998,17 @@ def _format_task_details(task: Dict[str, Any]) -> str:
 
 
 async def render_tasks(callback: types.CallbackQuery):
-    """Render the timers screen (no callback.answer — callers own it)."""
-    tasks = get_user_tasks(callback.from_user.id)
-    active_count = sum(1 for t in tasks if t.get("status") in ACTIVE_TASK_STATUSES)
+    """Render the timers screen showing ONLY active timers (no callback.answer — callers own it)."""
+    all_tasks = get_user_tasks(callback.from_user.id)
+    tasks = [t for t in all_tasks if t.get("status") in ACTIVE_TASK_STATUSES]
     header_lines = ["📊 <b>Мои таймеры</b>"]
     if not tasks:
-        header_lines.append("\nУ вас пока нет таймеров. Создайте новый через «📨 Новая рассылка» → «⏰ Задать таймер».")
+        header_lines.append("\nАктивных таймеров нет. Создайте новый через «📨 Новая рассылка» → «⏰ Задать таймер».")
     else:
-        header_lines.append(f"\nВсего: {len(tasks)}, активных: {active_count}\n")
+        header_lines.append(f"\nАктивных таймеров: {len(tasks)}\n")
         for i, task in enumerate(tasks, 1):
             tid = str(task.get("id") or task.get("task_id") or "?")[:8]
-            status = {"active": "🟢", "pending": "🟡", "completed": "✅",
-                      "error": "❌", "failed": "❌", "cancelled": "🚫"}.get(task.get("status"), "⚪")
+            status = {"active": "🟢", "pending": "🟡"}.get(task.get("status"), "⚪")
             header_lines.append(
                 f"{i}. {status} {tid} — {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)} повторов, "
                 f"интервал {task.get('interval_minutes', 1)} мин."
@@ -1008,8 +1019,7 @@ async def render_tasks(callback: types.CallbackQuery):
         if not task_id:
             continue
         row = [InlineKeyboardButton(text=f"ℹ️ {str(task_id)[:8]}", callback_data=f"task_details:{task_id}")]
-        if task.get("status") in ACTIVE_TASK_STATUSES:
-            row.append(InlineKeyboardButton(text="🚫 Отменить", callback_data=f"cancel_task:{task_id}"))
+        row.append(InlineKeyboardButton(text="🚫 Отменить", callback_data=f"cancel_task:{task_id}"))
         kb.append(row)
     kb.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data="tasks")])
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
@@ -1076,8 +1086,9 @@ async def cb_groups(callback: types.CallbackQuery):
     try:
         group_lists = get_group_lists(callback.from_user.id)
         kb = [[InlineKeyboardButton(text="➕ Создать список", callback_data="create_group_list")]]
-        kb.extend([InlineKeyboardButton(text=f"📋 {item['name']} ({len(item['groups'])})",
-                                        callback_data=f"manage_group_list:{item['id']}") for item in group_lists])
+        kb.extend([[InlineKeyboardButton(text=f"📋 {item['name']} ({len(item['groups'])})",
+                                         callback_data=f"manage_group_list:{item['id']}")]
+                   for item in group_lists])
         kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
         await safe_edit(callback, "📋 Списки каналов для рассылки:", InlineKeyboardMarkup(inline_keyboard=kb))
         await safe_answer(callback)
