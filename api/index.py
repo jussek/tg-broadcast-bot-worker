@@ -103,13 +103,21 @@ def _build_fsm_storage() -> BaseStorage:
     """Redis-backed FSM storage when Upstash credentials exist; else memory.
 
     MemoryStorage alone is unsafe on Vercel (process state disappears between
-    invocations), so it is only used as a local/test fallback.
+    invocations), so it is only used as a local/test fallback.  Construction
+    must never crash the whole serverless function: any failure while wiring
+    up Redis FSM degrades gracefully to MemoryStorage instead of returning
+    HTTP 500 for every request (import-time exceptions take down the deploy).
     """
     if os.getenv("UPSTASH_REDIS_REST_URL") and os.getenv("UPSTASH_REDIS_REST_TOKEN"):
-        from storage.redis_fsm_storage import RedisFSMStorage
+        try:
+            from storage.redis_fsm_storage import RedisFSMStorage
 
-        return RedisFSMStorage()
-    logger.warning("Redis credentials absent; FSM falls back to MemoryStorage (dev only)")
+            return RedisFSMStorage()
+        except Exception:
+            # Non-fatal: log loudly but keep the app importable/running.
+            logger.exception("Redis FSM storage unavailable; falling back to MemoryStorage")
+    else:
+        logger.warning("Redis credentials absent; FSM falls back to MemoryStorage (dev only)")
     return MemoryStorage()
 
 
