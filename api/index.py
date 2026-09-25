@@ -20,9 +20,17 @@ import html
 import json
 import logging
 import os
+import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Vercel imports this module as ``index`` with the repo root NOT on sys.path
+# (only the function directory is).  Make sibling packages importable.
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
