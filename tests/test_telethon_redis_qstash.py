@@ -102,7 +102,7 @@ def test_get_telethon_client_unauthorized_disconnects(monkeypatch):
     monkeypatch.setattr(index, "API_ID", "1")
     monkeypatch.setattr(index, "API_HASH", "hash")
     monkeypatch.setattr(index, "TELEGRAM_SESSION_STRING", "session")
-    monkeypatch.setattr(index, "TelegramClient", lambda *a, **k: FakeClient())
+    monkeypatch.setattr(index, "get_telethon_client_factory", lambda: FakeClient())
 
     with pytest.raises(index.SessionNotAuthorizedError):
         asyncio.run(index.get_telethon_client())
@@ -138,7 +138,7 @@ def test_broadcast_message_isolates_failures(monkeypatch):
             return gid
 
         async def send_message(self, entity, text, parse_mode=None):
-            if entity == "bad":
+            if entity == -2:
                 raise ValueError("boom")
             calls["sent"].append(entity)
 
@@ -149,10 +149,11 @@ def test_broadcast_message_isolates_failures(monkeypatch):
         return FakeClient()
 
     monkeypatch.setattr(index, "get_telethon_client", fake_client)
-    result = asyncio.run(index.broadcast_message(["good", "bad", "good2"], "hello"))
+    result = asyncio.run(index.broadcast_message(["-1", "-2", "-3"], "hello"))
 
     assert result["success"] == 2
     assert len(result["failures"]) == 1
+    assert calls["sent"] == [-1, -3]
     assert calls["disconnected"] is True
 
 
@@ -171,7 +172,7 @@ def test_create_and_schedule_task_persists_and_publishes(fake_redis, monkeypatch
     assert published == [(task_id, 5)]
 
 
-def test_duplicate_qstash_delivery_does_not_resend(fake_redis, client_app=None, monkeypatch=None):
+def test_duplicate_qstash_delivery_does_not_resend(fake_redis):
     """A repeated delivery of the same repeat number must be ignored."""
     from fastapi.testclient import TestClient
 
@@ -193,8 +194,9 @@ def test_duplicate_qstash_delivery_does_not_resend(fake_redis, client_app=None, 
 
     try:
         client = TestClient(index.app)
-        first = client.post("/api/process", json={"task_id": "t1"})
-        second = client.post("/api/process", json={"task_id": "t1"})
+        headers = {"Message-Id": "m1"}
+        first = client.post("/api/process", json={"task_id": "t1"}, headers=headers)
+        second = client.post("/api/process", json={"task_id": "t1"}, headers=headers)
         assert first.status_code == 200
         assert first.json()["ok"] is True
         assert second.json().get("status") == "duplicate_ignored"

@@ -96,10 +96,15 @@ def dispatch(callback_data):
     async def _match():
         for h in index.dp.callback_query.handlers:
             try:
-                # aiogram's CheckResult is a tuple subclass (passing, kwargs);
-                # plain bools are also tolerated.
+                # aiogram 3.x HandlerObject.check returns a plain tuple
+                # (passing, data); older CheckResult exposed a .passing
+                # attribute — read the tuple element first, fall back to the
+                # attribute, then to the raw value (plain bool).
                 result = await h.check(cbq)
-                passing = getattr(result, "passing", result)
+                if isinstance(result, tuple):
+                    passing = bool(result[0])
+                else:
+                    passing = bool(getattr(result, "passing", result))
             except Exception:
                 passing = False
             if passing:
@@ -164,11 +169,12 @@ def test_pagination_preserves_selected_groups(fake_redis):
     cb = run_callback("groups_page:1")
     state = index.get_user_state(42)
     assert state["group_page"] == 1
-    assert state["selected_groups"] == [5]  # preserved across page switch
+    # chat ids are kept as strings end-to-end (see storage.models._decode_state)
+    assert state["selected_groups"] == ["-5"]  # preserved across page switch
 
     cb = run_callback("toggle_group:-25")
     state = index.get_user_state(42)
-    assert sorted(state["selected_groups"]) == [5, 25]
+    assert sorted(state["selected_groups"]) == ["-25", "-5"]
 
     cb = run_callback("groups_page:99")  # clamped to last page
     assert index.get_user_state(42)["group_page"] == 2

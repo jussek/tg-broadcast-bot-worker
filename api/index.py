@@ -1434,8 +1434,22 @@ async def process_task(request: Request):
     if not task_id:
         raise HTTPException(status_code=400, detail="No task_id")
 
-    # Idempotency across repeated deliveries: lock per (task, repeat) so a
-    # duplicate delivery of the same repeat cannot send twice.
+    # Idempotency across repeated deliveries: QStash exposes a stable
+    # Message-Id header for every invocation (retries carry the same id), so
+    # we dedupe on it first.  Additionally we lock per (task, repeat) so even
+    # legacy publishers without a Message-Id cannot send the same repeat twice.
+    message_id = request.headers.get("Message-Id") or request.headers.get("message-id")
+    if message_id:
+        msg_key = f"broadcast:qstash_message:{message_id}"
+        try:
+            seen_before = bool(get_redis().get(msg_key))
+        except Exception:
+            logger.exception("Message-Id dedupe check failed; continuing")
+            seen_before = False
+        if seen_before:
+            logger.info("Duplicate QStash delivery (Message-Id %s) ignored", message_id)
+            return JSONResponse(content={"ok": True, "status": "duplicate_ignored"})
+
     pre_task = get_task(task_id)
     if not pre_task:
         return JSONResponse(content={"ok": False, "error": "Task not found"})
