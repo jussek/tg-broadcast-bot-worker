@@ -665,19 +665,67 @@ async def cb_delete_template(callback: types.CallbackQuery):
     save_user_templates(callback.from_user.id, templates)
     await cb_templates(callback)
 
+def _task_status_label(status: str) -> str:
+    return {
+        "active": "🟢 Активен",
+        "pending": "🟡 В очереди",
+        "completed": "✅ Завершён",
+        "cancelled": "🚫 Отменён",
+        "error": "❌ Ошибка",
+        "failed": "❌ Ошибка",
+    }.get(status, f"⚪ {status or 'нет статуса'}")
+
+
+def _format_task_details(task: Dict[str, Any]) -> str:
+    task_id = task.get("task_id") or task.get("id") or "?"
+    lines = [
+        f"⏰ <b>Таймер {str(task_id)[:8]}</b>",
+        f"Статус: {_task_status_label(task.get('status'))}",
+        f"Интервал: {task.get('interval_minutes', 1)} мин.",
+        f"Повторы: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)}",
+        f"Каналов: {len(task.get('groups', []))}",
+    ]
+    if task.get("status") == "active" and task.get("next_run"):
+        lines.append(f"Следующий запуск: {time.strftime('%d.%m.%Y %H:%M UTC', time.gmtime(task['next_run']))}")
+    message_preview = (task.get("message") or "").strip().replace("\n", " ")
+    if message_preview:
+        if len(message_preview) > 120:
+            message_preview = message_preview[:120] + "…"
+        lines.append(f"Сообщение: <i>{html.escape(message_preview)}</i>")
+    return "\n".join(lines)
+
+
 @dp.callback_query(lambda c: c.data == "tasks")
 async def cb_tasks(callback: types.CallbackQuery):
     tasks = get_user_tasks(callback.from_user.id)
+    active_count = sum(1 for t in tasks if t.get("status") in ("active", "pending"))
+    header_lines = ["📊 <b>Мои таймеры</b>"]
+    if not tasks:
+        header_lines.append("\nУ вас пока нет таймеров. Создайте новый через «📨 Новая рассылка» → «⏰ Задать таймер».")
+    else:
+        header_lines.append(f"\nВсего: {len(tasks)}, активных: {active_count}\n")
+        for i, task in enumerate(tasks, 1):
+            tid = str(task.get("task_id") or task.get("id") or "?")[:8]
+            status = {"active": "🟢", "pending": "🟡", "completed": "✅", "error": "❌", "failed": "❌", "cancelled": "🚫"}.get(task.get("status"), "⚪")
+            header_lines.append(
+                f"{i}. {status} {tid} — {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)} повторов, "
+                f"интервал {task.get('interval_minutes', 1)} мин."
+            )
     kb = []
     for task in tasks:
-        status = {"active": "🟢", "completed": "✅", "error": "❌", "cancelled": "🚫"}.get(task.get("status"), "⚪")
-        task_name = f"{status} Таймер: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)} повторов"
-        # Добавляем две кнопки для каждого таймера: одна для деталей, вторая для быстрой отмены (если активен)
-        kb.append([InlineKeyboardButton(text=task_name, callback_data=f"task_details:{task['task_id']}")])
-        if task.get("status") == "active":
-            kb.append([InlineKeyboardButton(text="  🚫 Отменить этот таймер", callback_data=f"cancel_task:{task['task_id']}")])
+        task_id = task.get("task_id") or task.get("id")
+        if not task_id:
+            continue
+        row = [InlineKeyboardButton(text=f"ℹ️ {str(task_id)[:8]}", callback_data=f"task_details:{task_id}")]
+        if task.get("status") in ("active", "pending"):
+            row.append(InlineKeyboardButton(text="🚫 Отменить", callback_data=f"cancel_task:{task_id}"))
+        kb.append(row)
+    kb.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data="tasks")])
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
-    await callback.message.edit_text("📊 Мои таймеры:" if tasks else "📊 Активных или сохранённых таймеров нет.", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.message.edit_text(
+        "\n".join(header_lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+    )
     await callback.answer()
 
 
@@ -685,21 +733,15 @@ async def cb_tasks(callback: types.CallbackQuery):
 async def cb_task_details(callback: types.CallbackQuery):
     task_id = callback.data.split(":", 1)[1]
     task = get_task(task_id)
-    if not task or task.get("user_id") != callback.from_user.id:
+    if not task or int(task.get("user_id", -1)) != int(callback.from_user.id):
         await callback.answer("Таймер не найден.", show_alert=True)
         return
     kb = []
-    if task.get("status") == "active":
+    if task.get("status") in ("active", "pending"):
         kb.append([InlineKeyboardButton(text="🚫 Отменить таймер", callback_data=f"cancel_task:{task_id}")])
-    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="tasks")])
+    kb.append([InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="tasks")])
     await callback.message.edit_text(
-        f"⏰ Таймер {task_id[:8]}\nСтатус: {task.get('status')}\n"
-        f"Интервал: {task.get('interval_minutes', 1)} мин.\n"
-        f"Повторы: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)}\n"
-        f"Каналов: {len(task.get('groups', []))}"
-        + (f"\nСледующий запуск: {time.strftime('%d.%m.%Y %H:%M UTC', time.gmtime(task['next_run']))}"
-           if task.get("status") == "active" and task.get("next_run") else ""),
-        f"Каналов: {len(task.get('groups', []))}",
+        _format_task_details(task),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
     )
     await callback.answer()
@@ -709,12 +751,16 @@ async def cb_task_details(callback: types.CallbackQuery):
 async def cb_cancel_task(callback: types.CallbackQuery):
     task_id = callback.data.split(":", 1)[1]
     task = get_task(task_id)
-    if not task or task.get("user_id") != callback.from_user.id:
+    if not task or int(task.get("user_id", -1)) != int(callback.from_user.id):
         await callback.answer("Таймер не найден.", show_alert=True)
         return
+    if task.get("status") not in ("active", "pending"):
+        await callback.answer("Этот таймер уже не активен.", show_alert=True)
+        return
     task["status"] = "cancelled"
+    task["cancelled_at"] = time.time()
     save_task(task_id, task)
-    await callback.answer("Таймер отменён.")
+    await callback.answer("✅ Таймер отменён, рассылка остановлена.")
     await cb_tasks(callback)
 
 @dp.callback_query(lambda c: c.data == "groups")
