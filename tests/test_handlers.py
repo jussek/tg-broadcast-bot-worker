@@ -89,15 +89,20 @@ def make_update(callback_data, user_id=42):
 
 
 def dispatch(callback_data):
-    update = make_update(callback_data)
+    # aiogram registers callback_query handlers with event=CallbackQuery,
+    # so filters must be checked against CallbackQuery, not Update.
+    cbq = make_update(callback_data).callback_query
 
     async def _match():
         for h in index.dp.callback_query.handlers:
             try:
-                result = await h.check(update)
+                # aiogram's CheckResult is a tuple subclass (passing, kwargs);
+                # plain bools are also tolerated.
+                result = await h.check(cbq)
+                passing = getattr(result, "passing", result)
             except Exception:
-                result = False
-            if getattr(result, "passing", False):
+                passing = False
+            if passing:
                 return h
         raise AssertionError(f"No handler matches {callback_data!r}")
 
