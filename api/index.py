@@ -345,7 +345,9 @@ async def safe_answer(callback: types.CallbackQuery, text: Optional[str] = None,
         else:
             await callback.answer(text, **kwargs)
     except Exception:
-        logger.info("Unable to answer callback %r (stale?)", callback.data)
+        # A stale/expired callback must not break the flow — but real bugs
+        # (AttributeError etc.) should still be visible in logs with traceback.
+        logger.exception("Unable to answer callback %r (stale?)", callback.data)
 
 
 async def safe_edit(callback: types.CallbackQuery, text: str, reply_markup=None) -> bool:
@@ -555,13 +557,16 @@ async def cb_toggle_group(callback: types.CallbackQuery):
         else:
             selected.append(gid)
 
+        groups = load_groups_cache(user_id)
+        if groups is None:
+            # Cache missing/expired — do NOT persist a selection the user
+            # cannot see; just tell them to refresh the picker.
+            await safe_answer(callback, "Список групп устарел, нажмите «Выбрать каналы вручную»", show_alert=True)
+            return
+
         state["selected_groups"] = selected
         set_user_state(user_id, state)
 
-        groups = load_groups_cache(user_id)
-        if groups is None:
-            await safe_answer(callback, "Список групп устарел, нажмите «Выбрать каналы вручную»", show_alert=True)
-            return
         page = int(state.get("group_page", 0) or 0)
         await safe_edit(callback, "📋 Выберите группы для рассылки:",
                         groups_selection_keyboard(selected, groups, page))
@@ -854,17 +859,18 @@ async def cb_cancel(callback: types.CallbackQuery):
 # ============================================================================
 @dp.callback_query(F.data == "templates")
 async def cb_templates(callback: types.CallbackQuery):
-    try:
-        templates = get_user_templates(callback.from_user.id)
-        kb = [[InlineKeyboardButton(text="➕ Создать шаблон", callback_data="create_template")]]
-        kb.extend([InlineKeyboardButton(text=f"📝 {item['name']}", callback_data=f"manage_template:{item['id']}")]
-                  for item in templates)
-        kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
-        await safe_edit(callback, "📚 Шаблоны сообщений:", InlineKeyboardMarkup(inline_keyboard=kb))
-        await safe_answer(callback)
-    except Exception:
-        logger.exception("Callback failed: %s", callback.data)
-        await safe_answer(callback, "❌ Произошла ошибка. Попробуйте ещё раз.", show_alert=True)
+    await render_templates(callback)
+    await safe_answer(callback)
+
+
+async def render_templates(callback: types.CallbackQuery):
+    """Render the templates screen (no callback.answer — callers own it)."""
+    templates = get_user_templates(callback.from_user.id)
+    kb = [[InlineKeyboardButton(text="➕ Создать шаблон", callback_data="create_template")]]
+    kb.extend([InlineKeyboardButton(text=f"📝 {item['name']}", callback_data=f"manage_template:{item['id']}")]
+              for item in templates)
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
+    await safe_edit(callback, "📚 Шаблоны сообщений:", InlineKeyboardMarkup(inline_keyboard=kb))
 
 
 @dp.callback_query(F.data == "create_template")
@@ -904,7 +910,8 @@ async def cb_delete_template(callback: types.CallbackQuery):
         template_id = callback.data.split(":", 1)[1]
         templates = [item for item in get_user_templates(callback.from_user.id) if item["id"] != template_id]
         save_user_templates(callback.from_user.id, templates)
-        await cb_templates(callback)
+        await render_templates(callback)
+        await safe_answer(callback, "🗑 Шаблон удалён.")
     except Exception:
         logger.exception("Callback failed: %s", callback.data)
         await safe_answer(callback, "❌ Произошла ошибка. Попробуйте ещё раз.", show_alert=True)
@@ -943,36 +950,41 @@ def _format_task_details(task: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+async def render_tasks(callback: types.CallbackQuery):
+    """Render the timers screen (no callback.answer — callers own it)."""
+    tasks = get_user_tasks(callback.from_user.id)
+    active_count = sum(1 for t in tasks if t.get("status") in ACTIVE_TASK_STATUSES)
+    header_lines = ["📊 <b>Мои таймеры</b>"]
+    if not tasks:
+        header_lines.append("\nУ вас пока нет таймеров. Создайте новый через «📨 Новая рассылка» → «⏰ Задать таймер».")
+    else:
+        header_lines.append(f"\nВсего: {len(tasks)}, активных: {active_count}\n")
+        for i, task in enumerate(tasks, 1):
+            tid = str(task.get("id") or task.get("task_id") or "?")[:8]
+            status = {"active": "🟢", "pending": "🟡", "completed": "✅",
+                      "error": "❌", "failed": "❌", "cancelled": "🚫"}.get(task.get("status"), "⚪")
+            header_lines.append(
+                f"{i}. {status} {tid} — {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)} повторов, "
+                f"интервал {task.get('interval_minutes', 1)} мин."
+            )
+    kb = []
+    for task in tasks:
+        task_id = task.get("id") or task.get("task_id")
+        if not task_id:
+            continue
+        row = [InlineKeyboardButton(text=f"ℹ️ {str(task_id)[:8]}", callback_data=f"task_details:{task_id}")]
+        if task.get("status") in ACTIVE_TASK_STATUSES:
+            row.append(InlineKeyboardButton(text="🚫 Отменить", callback_data=f"cancel_task:{task_id}"))
+        kb.append(row)
+    kb.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data="tasks")])
+    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
+    await safe_edit(callback, "\n".join(header_lines), InlineKeyboardMarkup(inline_keyboard=kb))
+
+
 @dp.callback_query(F.data == "tasks")
 async def cb_tasks(callback: types.CallbackQuery):
     try:
-        tasks = get_user_tasks(callback.from_user.id)
-        active_count = sum(1 for t in tasks if t.get("status") in ACTIVE_TASK_STATUSES)
-        header_lines = ["📊 <b>Мои таймеры</b>"]
-        if not tasks:
-            header_lines.append("\nУ вас пока нет таймеров. Создайте новый через «📨 Новая рассылка» → «⏰ Задать таймер».")
-        else:
-            header_lines.append(f"\nВсего: {len(tasks)}, активных: {active_count}\n")
-            for i, task in enumerate(tasks, 1):
-                tid = str(task.get("id") or task.get("task_id") or "?")[:8]
-                status = {"active": "🟢", "pending": "🟡", "completed": "✅",
-                          "error": "❌", "failed": "❌", "cancelled": "🚫"}.get(task.get("status"), "⚪")
-                header_lines.append(
-                    f"{i}. {status} {tid} — {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)} повторов, "
-                    f"интервал {task.get('interval_minutes', 1)} мин."
-                )
-        kb = []
-        for task in tasks:
-            task_id = task.get("id") or task.get("task_id")
-            if not task_id:
-                continue
-            row = [InlineKeyboardButton(text=f"ℹ️ {str(task_id)[:8]}", callback_data=f"task_details:{task_id}")]
-            if task.get("status") in ACTIVE_TASK_STATUSES:
-                row.append(InlineKeyboardButton(text="🚫 Отменить", callback_data=f"cancel_task:{task_id}"))
-            kb.append(row)
-        kb.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data="tasks")])
-        kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
-        await safe_edit(callback, "\n".join(header_lines), InlineKeyboardMarkup(inline_keyboard=kb))
+        await render_tasks(callback)
         await safe_answer(callback)
     except Exception:
         logger.exception("Callback failed: %s", callback.data)
@@ -1012,7 +1024,9 @@ async def cb_cancel_task(callback: types.CallbackQuery):
         task["status"] = "cancelled"
         task["cancelled_at"] = time.time()
         save_task(task)
-        await cb_tasks(callback)
+        # Re-render the timer list (render function does not answer), then
+        # toast the result — exactly one callback.answer().
+        await render_tasks(callback)
         await safe_answer(callback, "✅ Таймер отменён, рассылка остановлена.")
     except Exception:
         logger.exception("Callback failed: %s", callback.data)

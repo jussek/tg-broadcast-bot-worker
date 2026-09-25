@@ -1,6 +1,3 @@
-# Compiled and build artifacts
+# Python bytecode
 __pycache__/
 *.pyc
-
-# Environment
-.env
