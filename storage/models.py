@@ -12,7 +12,7 @@ from .redis_client import get_redis
 # Constants
 # ============================================================================
 
-SET_STATE_FIELDS = {"selected", "template_group_ids", "legacy_template_chat_ids", "chat_picker_selected_ids"}
+SET_STATE_FIELDS = {"selected", "template_group_ids", "legacy_template_chat_ids", "chat_picker_selected_ids", "selected_groups"}
 
 
 # ============================================================================
@@ -153,22 +153,28 @@ def _encode_state(state: dict) -> dict:
     encoded = {}
     for key, value in state.items():
         if isinstance(value, set):
-            encoded[key] = list(value)
+            # Sort sets so JSON payloads are deterministic (testable).
+            encoded[key] = sorted(str(x) for x in value)
         else:
             encoded[key] = value
     return encoded
 
 
 def _decode_state(state: dict) -> dict:
+    # NOTE: sets are intentionally NOT used for state fields — Redis stores
+    # JSON, and set membership is unordered (non-deterministic after encode).
+    # All fields decode to lists; the bot treats chat ids as strings.
     decoded = dict(state)
     for key in SET_STATE_FIELDS:
         if key not in decoded or decoded[key] is None:
             continue
         values = decoded[key]
-        if key == "template_group_ids":
-            decoded[key] = {str(x) for x in values}
+        if key == "selected_groups":
+            # Chat ids may exceed int range expectations elsewhere; the bot
+            # works with them as strings end-to-end.
+            decoded[key] = [str(x) for x in values]
         else:
-            decoded[key] = {int(x) for x in values}
+            decoded[key] = [int(x) for x in values]
     return decoded
 
 
