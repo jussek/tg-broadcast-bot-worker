@@ -8,6 +8,5 @@
       "maxDuration": 60,
       "includeFiles": "{storage,services,bot}/**"
     }
-  },
-  "cleanCache": true
+  }
 }
