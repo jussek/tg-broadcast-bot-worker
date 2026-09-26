@@ -151,7 +151,7 @@ def test_broadcast_message_isolates_failures(monkeypatch):
         return FakeClient()
 
     monkeypatch.setattr(index, "get_telethon_client", fake_client)
-    result = asyncio.run(index.broadcast_message(["-1", "-2", "-3"], "hello"))
+    result = asyncio.run(index.broadcast_message(["-1", "-2", "-1", "-3"], "hello"))
 
     assert result["success"] == 2
     assert len(result["failures"]) == 1
@@ -163,15 +163,18 @@ def test_broadcast_message_isolates_failures(monkeypatch):
 def test_create_and_schedule_task_persists_and_publishes(fake_redis, monkeypatch):
     published = []
     monkeypatch.setattr(index, "schedule_process",
-                        lambda task_id, delay: published.append((task_id, delay)))
-    state = {"message_text": "hi", "selected_groups": ["-1001"], "interval_minutes": 5, "total_repeats": 3}
+                        lambda task_id, delay, expected_repeat: published.append(
+                            (task_id, delay, expected_repeat)))
+    state = {"message_text": "hi", "selected_groups": ["-1001", "-1001"],
+             "interval_minutes": 5, "total_repeats": 3}
     task_id = asyncio.run(index.create_and_schedule_task(42, state))
 
     task = json.loads(fake_redis.store[f"broadcast:task:{task_id}"])
     assert task["status"] == "active"
     assert task["total_repeats"] == 3
+    assert task["groups"] == ["-1001"]
     assert task_id in fake_redis.sets["broadcast:user:42:tasks"]
-    assert published == [(task_id, 5)]
+    assert published == [(task_id, 5, 0)]
 
 
 def test_duplicate_qstash_delivery_does_not_resend(fake_redis):
@@ -229,6 +232,64 @@ def test_completed_task_stops_rescheduling(fake_redis, monkeypatch):
     saved = json.loads(fake_redis.store["broadcast:task:t2"])
     assert saved["status"] == "completed"
     assert rescheduled == []
+
+
+def test_early_delivery_waits_until_next_run(fake_redis, monkeypatch):
+    """A premature/replayed QStash request must not consume a send."""
+    from fastapi.testclient import TestClient
+
+    now = 1_800_000_000.0
+    task = {"id": "early", "user_id": 1, "status": "active", "message": "m",
+            "groups": ["-1001"], "completed_repeats": 0, "total_repeats": 2,
+            "interval_minutes": 5, "next_run": now + 75.2}
+    fake_redis.set("broadcast:task:early", json.dumps(task))
+    sent = []
+    delayed = []
+
+    async def fake_broadcast(groups, text):
+        sent.append(1)
+        return {"success": 1, "failures": []}
+
+    monkeypatch.setattr(index.time, "time", lambda: now)
+    monkeypatch.setattr(index, "broadcast_message", fake_broadcast)
+    monkeypatch.setattr(index, "schedule_process_in_seconds",
+                        lambda task_id, delay, expected_repeat: delayed.append(
+                            (task_id, delay, expected_repeat)))
+
+    response = TestClient(index.app).post(
+        "/api/process", json={"task_id": "early"}, headers={"Message-Id": "too-soon"})
+
+    assert response.json()["status"] == "not_due_yet"
+    assert sent == []
+    assert delayed == [("early", pytest.approx(75.2), 0)]
+    assert index.get_task("early")["completed_repeats"] == 0
+    assert "broadcast:processed:early:0" not in fake_redis.store
+
+
+def test_stale_delivery_cannot_trigger_the_next_repeat(fake_redis, monkeypatch):
+    """Two provider messages for repeat zero must still produce one send."""
+    from fastapi.testclient import TestClient
+
+    task = {"id": "generation", "user_id": 1, "status": "active", "message": "m",
+            "groups": ["-1001"], "completed_repeats": 1, "total_repeats": 3,
+            "interval_minutes": 5, "next_run": 0}
+    fake_redis.set("broadcast:task:generation", json.dumps(task))
+    sent = []
+
+    async def fake_broadcast(groups, text):
+        sent.append(1)
+        return {"success": 1, "failures": []}
+
+    monkeypatch.setattr(index, "broadcast_message", fake_broadcast)
+    response = TestClient(index.app).post(
+        "/api/process",
+        json={"task_id": "generation", "expected_repeat": 0},
+        headers={"Message-Id": "obsolete-repeat-zero"},
+    )
+
+    assert response.json()["status"] == "stale_delivery"
+    assert sent == []
+    assert index.get_task("generation")["completed_repeats"] == 1
 
 
 def test_cancelled_task_not_executed(fake_redis, monkeypatch):
