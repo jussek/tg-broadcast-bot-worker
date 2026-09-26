@@ -362,6 +362,7 @@ def schedule_process(task_id: str, delay_minutes: int, expected_repeat: int = 0)
 
 
 def schedule_process_in_seconds(task_id: str, delay_seconds: float, expected_repeat: int):
+def schedule_process_in_seconds(task_id: str, delay_seconds: float):
     """Publish a delivery using the remaining wall-clock delay.
 
     QStash delays are relative.  This variant is used when QStash calls the
@@ -373,6 +374,7 @@ def schedule_process_in_seconds(task_id: str, delay_seconds: float, expected_rep
     get_qstash().message.publish_json(
         url=f"{APP_URL}/api/process",
         body={"task_id": task_id, "expected_repeat": int(expected_repeat)},
+        body={"task_id": task_id},
         delay=f"{seconds}s",
     )
 
@@ -1611,6 +1613,7 @@ async def process_task(request: Request):
         next_run = float(task.get("next_run") or 0)
         if next_run > now + 1:
             schedule_process_in_seconds(task_id, next_run - now, current_repeat)
+            schedule_process_in_seconds(task_id, next_run - now)
             get_redis().delete(dedupe_key)
             _mark_message_seen()
             return JSONResponse(content={"ok": True, "status": "not_due_yet"})
