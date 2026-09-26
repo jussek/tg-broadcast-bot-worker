@@ -231,6 +231,37 @@ def test_completed_task_stops_rescheduling(fake_redis, monkeypatch):
     assert rescheduled == []
 
 
+def test_early_delivery_waits_until_next_run(fake_redis, monkeypatch):
+    """A premature/replayed QStash request must not consume a send."""
+    from fastapi.testclient import TestClient
+
+    now = 1_800_000_000.0
+    task = {"id": "early", "user_id": 1, "status": "active", "message": "m",
+            "groups": ["-1001"], "completed_repeats": 0, "total_repeats": 2,
+            "interval_minutes": 5, "next_run": now + 75.2}
+    fake_redis.set("broadcast:task:early", json.dumps(task))
+    sent = []
+    delayed = []
+
+    async def fake_broadcast(groups, text):
+        sent.append(1)
+        return {"success": 1, "failures": []}
+
+    monkeypatch.setattr(index.time, "time", lambda: now)
+    monkeypatch.setattr(index, "broadcast_message", fake_broadcast)
+    monkeypatch.setattr(index, "schedule_process_in_seconds",
+                        lambda task_id, delay: delayed.append((task_id, delay)))
+
+    response = TestClient(index.app).post(
+        "/api/process", json={"task_id": "early"}, headers={"Message-Id": "too-soon"})
+
+    assert response.json()["status"] == "not_due_yet"
+    assert sent == []
+    assert delayed == [("early", pytest.approx(75.2))]
+    assert index.get_task("early")["completed_repeats"] == 0
+    assert "broadcast:processed:early:0" not in fake_redis.store
+
+
 def test_cancelled_task_not_executed(fake_redis, monkeypatch):
     from fastapi.testclient import TestClient
 
