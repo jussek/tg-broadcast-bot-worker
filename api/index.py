@@ -19,6 +19,7 @@ import asyncio
 import html
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -299,7 +300,12 @@ async def broadcast_message(groups: List[str], text: str) -> Dict[str, Any]:
     success = 0
     failures: List[Dict[str, str]] = []
     try:
-        for gid in groups:
+        # A chat can occur more than once after combining a saved list with a
+        # manual selection (and old tasks may already contain duplicates).
+        # Telegram has no request-level idempotency key for these sends, so
+        # normalize and de-duplicate ids before making any network calls.
+        unique_groups = list(dict.fromkeys(str(gid) for gid in groups))
+        for gid in unique_groups:
             try:
                 entity = await client.get_entity(int(gid))
                 await client.send_message(entity, text, parse_mode="html")
@@ -346,12 +352,28 @@ def get_qstash() -> QStash:
     return _qstash_client
 
 
-def schedule_process(task_id: str, delay_minutes: int):
+def schedule_process(task_id: str, delay_minutes: int, expected_repeat: int = 0):
     """Publish a delayed delivery of the task to /api/process via QStash."""
     get_qstash().message.publish_json(
         url=f"{APP_URL}/api/process",
-        body={"task_id": task_id},
+        body={"task_id": task_id, "expected_repeat": int(expected_repeat)},
         delay=f"{int(delay_minutes)}m",
+    )
+
+
+def schedule_process_in_seconds(task_id: str, delay_seconds: float, expected_repeat: int):
+    """Publish a delivery using the remaining wall-clock delay.
+
+    QStash delays are relative.  This variant is used when QStash calls the
+    endpoint before the persisted ``next_run`` timestamp (for example after a
+    clock skew or a manually replayed request), so rounding to whole minutes
+    cannot make a timer run early.
+    """
+    seconds = max(1, math.ceil(delay_seconds))
+    get_qstash().message.publish_json(
+        url=f"{APP_URL}/api/process",
+        body={"task_id": task_id, "expected_repeat": int(expected_repeat)},
+        delay=f"{seconds}s",
     )
 
 
@@ -500,7 +522,7 @@ async def create_and_schedule_task(user_id: int, state: Dict[str, Any]) -> str:
         "id": task_id,
         "user_id": int(user_id),
         "message": state["message_text"],
-        "groups": list(state["selected_groups"]),
+        "groups": list(dict.fromkeys(str(gid) for gid in state["selected_groups"])),
         "interval_minutes": interval_minutes,
         "completed_repeats": 0,
         "total_repeats": total_repeats,
@@ -512,7 +534,7 @@ async def create_and_schedule_task(user_id: int, state: Dict[str, Any]) -> str:
     get_redis().sadd(f"broadcast:user:{user_id}:tasks", task_id)
 
     try:
-        schedule_process(task_id, interval_minutes)
+        schedule_process(task_id, interval_minutes, expected_repeat=0)
     except Exception:
         task_data["status"] = "error"
         save_task(task_data)
@@ -988,7 +1010,11 @@ def _format_task_details(task: Dict[str, Any]) -> str:
         f"Каналов: {len(task.get('groups', []))}",
     ]
     if task.get("status") in ACTIVE_TASK_STATUSES and task.get("next_run"):
-        lines.append(f"Следующий запуск: {time.strftime('%d.%m.%Y %H:%M UTC', time.gmtime(float(task['next_run'])))}")
+        next_run = float(task["next_run"])
+        remaining = max(0, math.ceil(next_run - time.time()))
+        minutes, seconds = divmod(remaining, 60)
+        lines.append(f"До запуска: {minutes} мин. {seconds:02d} сек.")
+        lines.append(f"Следующий запуск: {time.strftime('%d.%m.%Y %H:%M:%S UTC', time.gmtime(next_run))}")
     message_preview = (task.get("message") or "").strip().replace("\n", " ")
     if message_preview:
         if len(message_preview) > 120:
@@ -1504,6 +1530,12 @@ async def process_task(request: Request):
     task_id = body.get("task_id")
     if not task_id:
         raise HTTPException(status_code=400, detail="No task_id")
+    expected_repeat = body.get("expected_repeat")
+    if expected_repeat is not None:
+        try:
+            expected_repeat = int(expected_repeat)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid expected_repeat")
 
     # Idempotency across repeated deliveries: QStash exposes a stable
     # Message-Id header for every invocation (retries carry the same id), so
@@ -1545,6 +1577,13 @@ async def process_task(request: Request):
                 logger.exception("Failed to mark Message-Id %s as seen", message_id)
 
     if not acquire_task_lock(task_id, seconds=120):
+        # The dedupe marker was reserved above, but this delivery did not do
+        # any work.  Remove it so a retry can process the repeat after the
+        # in-flight worker (or an expired stale lock) is gone.
+        try:
+            get_redis().delete(dedupe_key)
+        except Exception:
+            logger.exception("Failed to release dedupe marker for locked task %s", task_id)
         logger.info("Task %s already processing", task_id)
         return JSONResponse(content={"ok": True, "status": "already_processing"})
 
@@ -1553,6 +1592,27 @@ async def process_task(request: Request):
         if not task or task.get("status") not in ACTIVE_TASK_STATUSES:
             _mark_message_seen()
             return JSONResponse(content={"ok": True, "status": "inactive_or_missing"})
+
+        current_repeat = int(task.get("completed_repeats", 0))
+        if expected_repeat is not None and expected_repeat != current_repeat:
+            # This is an obsolete delivery from an earlier schedule.  Without
+            # this generation check, a delayed duplicate of repeat N could be
+            # mistaken for repeat N+1 and send the same message again.
+            get_redis().delete(dedupe_key)
+            _mark_message_seen()
+            return JSONResponse(content={"ok": True, "status": "stale_delivery"})
+
+        # Never rely solely on the delivery provider's clock.  A replayed or
+        # prematurely delivered request must not shorten the timer selected by
+        # the user.  Requeue for the exact remaining number of seconds without
+        # consuming a repeat.
+        now = time.time()
+        next_run = float(task.get("next_run") or 0)
+        if next_run > now + 1:
+            schedule_process_in_seconds(task_id, next_run - now, current_repeat)
+            get_redis().delete(dedupe_key)
+            _mark_message_seen()
+            return JSONResponse(content={"ok": True, "status": "not_due_yet"})
 
         result = await broadcast_message(task.get("groups", []), task.get("message", ""))
         success_count, failures = result["success"], result["failures"]
@@ -1565,7 +1625,11 @@ async def process_task(request: Request):
             task["status"] = "active"
             task["next_run"] = time.time() + interval_minutes * 60
             try:
-                schedule_process(task_id, interval_minutes)
+                schedule_process(
+                    task_id,
+                    interval_minutes,
+                    expected_repeat=task["completed_repeats"],
+                )
             except Exception:
                 logger.exception("Unable to reschedule task %s", task_id)
                 task["status"] = "error"
