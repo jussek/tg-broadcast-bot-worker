@@ -300,7 +300,12 @@ async def broadcast_message(groups: List[str], text: str) -> Dict[str, Any]:
     success = 0
     failures: List[Dict[str, str]] = []
     try:
-        for gid in groups:
+        # A chat can occur more than once after combining a saved list with a
+        # manual selection (and old tasks may already contain duplicates).
+        # Telegram has no request-level idempotency key for these sends, so
+        # normalize and de-duplicate ids before making any network calls.
+        unique_groups = list(dict.fromkeys(str(gid) for gid in groups))
+        for gid in unique_groups:
             try:
                 entity = await client.get_entity(int(gid))
                 await client.send_message(entity, text, parse_mode="html")
@@ -347,15 +352,16 @@ def get_qstash() -> QStash:
     return _qstash_client
 
 
-def schedule_process(task_id: str, delay_minutes: int):
+def schedule_process(task_id: str, delay_minutes: int, expected_repeat: int = 0):
     """Publish a delayed delivery of the task to /api/process via QStash."""
     get_qstash().message.publish_json(
         url=f"{APP_URL}/api/process",
-        body={"task_id": task_id},
+        body={"task_id": task_id, "expected_repeat": int(expected_repeat)},
         delay=f"{int(delay_minutes)}m",
     )
 
 
+def schedule_process_in_seconds(task_id: str, delay_seconds: float, expected_repeat: int):
 def schedule_process_in_seconds(task_id: str, delay_seconds: float):
     """Publish a delivery using the remaining wall-clock delay.
 
@@ -367,6 +373,7 @@ def schedule_process_in_seconds(task_id: str, delay_seconds: float):
     seconds = max(1, math.ceil(delay_seconds))
     get_qstash().message.publish_json(
         url=f"{APP_URL}/api/process",
+        body={"task_id": task_id, "expected_repeat": int(expected_repeat)},
         body={"task_id": task_id},
         delay=f"{seconds}s",
     )
@@ -517,7 +524,7 @@ async def create_and_schedule_task(user_id: int, state: Dict[str, Any]) -> str:
         "id": task_id,
         "user_id": int(user_id),
         "message": state["message_text"],
-        "groups": list(state["selected_groups"]),
+        "groups": list(dict.fromkeys(str(gid) for gid in state["selected_groups"])),
         "interval_minutes": interval_minutes,
         "completed_repeats": 0,
         "total_repeats": total_repeats,
@@ -529,7 +536,7 @@ async def create_and_schedule_task(user_id: int, state: Dict[str, Any]) -> str:
     get_redis().sadd(f"broadcast:user:{user_id}:tasks", task_id)
 
     try:
-        schedule_process(task_id, interval_minutes)
+        schedule_process(task_id, interval_minutes, expected_repeat=0)
     except Exception:
         task_data["status"] = "error"
         save_task(task_data)
@@ -1001,7 +1008,7 @@ def _format_task_details(task: Dict[str, Any]) -> str:
         f"⏰ <b>Таймер {str(task_id)[:8]}</b>",
         f"Статус: {_task_status_label(task.get('status'))}",
         f"Интервал: {task.get('interval_minutes', 1)} мин.",
-        f"Повторы: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)}",
+        f"Выполнено отправок: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)}",
         f"Каналов: {len(task.get('groups', []))}",
     ]
     if task.get("status") in ACTIVE_TASK_STATUSES and task.get("next_run"):
@@ -1031,7 +1038,8 @@ async def render_tasks(callback: types.CallbackQuery):
             tid = str(task.get("id") or task.get("task_id") or "?")[:8]
             status = {"active": "🟢", "pending": "🟡"}.get(task.get("status"), "⚪")
             header_lines.append(
-                f"{i}. {status} {tid} — {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)} повторов, "
+                f"{i}. {status} {tid} — выполнено "
+                f"{task.get('completed_repeats', 0)} из {task.get('total_repeats', 1)} отправок, "
                 f"интервал {task.get('interval_minutes', 1)} мин."
             )
     kb = []
@@ -1525,6 +1533,12 @@ async def process_task(request: Request):
     task_id = body.get("task_id")
     if not task_id:
         raise HTTPException(status_code=400, detail="No task_id")
+    expected_repeat = body.get("expected_repeat")
+    if expected_repeat is not None:
+        try:
+            expected_repeat = int(expected_repeat)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid expected_repeat")
 
     # Idempotency across repeated deliveries: QStash exposes a stable
     # Message-Id header for every invocation (retries carry the same id), so
@@ -1582,6 +1596,15 @@ async def process_task(request: Request):
             _mark_message_seen()
             return JSONResponse(content={"ok": True, "status": "inactive_or_missing"})
 
+        current_repeat = int(task.get("completed_repeats", 0))
+        if expected_repeat is not None and expected_repeat != current_repeat:
+            # This is an obsolete delivery from an earlier schedule.  Without
+            # this generation check, a delayed duplicate of repeat N could be
+            # mistaken for repeat N+1 and send the same message again.
+            get_redis().delete(dedupe_key)
+            _mark_message_seen()
+            return JSONResponse(content={"ok": True, "status": "stale_delivery"})
+
         # Never rely solely on the delivery provider's clock.  A replayed or
         # prematurely delivered request must not shorten the timer selected by
         # the user.  Requeue for the exact remaining number of seconds without
@@ -1589,6 +1612,7 @@ async def process_task(request: Request):
         now = time.time()
         next_run = float(task.get("next_run") or 0)
         if next_run > now + 1:
+            schedule_process_in_seconds(task_id, next_run - now, current_repeat)
             schedule_process_in_seconds(task_id, next_run - now)
             get_redis().delete(dedupe_key)
             _mark_message_seen()
@@ -1605,7 +1629,11 @@ async def process_task(request: Request):
             task["status"] = "active"
             task["next_run"] = time.time() + interval_minutes * 60
             try:
-                schedule_process(task_id, interval_minutes)
+                schedule_process(
+                    task_id,
+                    interval_minutes,
+                    expected_repeat=task["completed_repeats"],
+                )
             except Exception:
                 logger.exception("Unable to reschedule task %s", task_id)
                 task["status"] = "error"
@@ -1631,6 +1659,13 @@ async def process_task(request: Request):
         return JSONResponse(content={"ok": True, "sent": success_count, "errors": len(failures)})
     except MissingEnvError as exc:
         logger.error("Process blocked: %s", exc)
+        # This failure is retryable after configuration is restored.  Do not
+        # leave the repeat reserved, otherwise QStash's retry would be treated
+        # as a duplicate and the timer would silently miss an execution.
+        try:
+            get_redis().delete(dedupe_key)
+        except Exception:
+            logger.exception("Failed to roll back dedupe key for task %s", task_id)
         return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=503)
     except SessionNotAuthorizedError as exc:
         logger.exception("Process blocked: Telethon session unauthorized")

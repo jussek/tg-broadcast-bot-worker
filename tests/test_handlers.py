@@ -223,6 +223,7 @@ def test_task_details_shows_all_fields(fake_redis):
     index.save_task(task)
     cb = run_callback(f"task_details:{task['id']}")
     body = cb.edits[-1][0]
+    for fragment in ("Таймер", "Статус", "Интервал", "Выполнено отправок: 1/5", "Каналов: 3", "До запуска", "Следующий запуск"):
     for fragment in ("Таймер", "Статус", "Интервал", "Повторы: 1/5", "Каналов: 3", "До запуска", "Следующий запуск"):
         assert fragment in body, f"missing {fragment!r} in task details"
     markup = cb.edits[-1][1]
