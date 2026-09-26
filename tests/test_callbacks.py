@@ -231,6 +231,7 @@ def test_tasks_screen_shows_only_active_timers(monkeypatch):
     assert not any("done1" in d or "canc1" in d for d in button_data if ":" in d)
     assert "done1" not in text and "canc1" not in text
     assert "Активных таймеров: 1" in text
+    assert "выполнено 1 из 3 отправок" in text
 
 
 def test_cancel_task_from_list_does_not_error_and_hides_timer(monkeypatch):

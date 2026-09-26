@@ -1006,7 +1006,7 @@ def _format_task_details(task: Dict[str, Any]) -> str:
         f"⏰ <b>Таймер {str(task_id)[:8]}</b>",
         f"Статус: {_task_status_label(task.get('status'))}",
         f"Интервал: {task.get('interval_minutes', 1)} мин.",
-        f"Повторы: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)}",
+        f"Выполнено отправок: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)}",
         f"Каналов: {len(task.get('groups', []))}",
     ]
     if task.get("status") in ACTIVE_TASK_STATUSES and task.get("next_run"):
@@ -1036,7 +1036,8 @@ async def render_tasks(callback: types.CallbackQuery):
             tid = str(task.get("id") or task.get("task_id") or "?")[:8]
             status = {"active": "🟢", "pending": "🟡"}.get(task.get("status"), "⚪")
             header_lines.append(
-                f"{i}. {status} {tid} — {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)} повторов, "
+                f"{i}. {status} {tid} — выполнено "
+                f"{task.get('completed_repeats', 0)} из {task.get('total_repeats', 1)} отправок, "
                 f"интервал {task.get('interval_minutes', 1)} мин."
             )
     kb = []
@@ -1655,6 +1656,13 @@ async def process_task(request: Request):
         return JSONResponse(content={"ok": True, "sent": success_count, "errors": len(failures)})
     except MissingEnvError as exc:
         logger.error("Process blocked: %s", exc)
+        # This failure is retryable after configuration is restored.  Do not
+        # leave the repeat reserved, otherwise QStash's retry would be treated
+        # as a duplicate and the timer would silently miss an execution.
+        try:
+            get_redis().delete(dedupe_key)
+        except Exception:
+            logger.exception("Failed to roll back dedupe key for task %s", task_id)
         return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=503)
     except SessionNotAuthorizedError as exc:
         logger.exception("Process blocked: Telethon session unauthorized")

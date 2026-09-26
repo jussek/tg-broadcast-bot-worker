@@ -292,6 +292,84 @@ def test_stale_delivery_cannot_trigger_the_next_repeat(fake_redis, monkeypatch):
     assert index.get_task("generation")["completed_repeats"] == 1
 
 
+def test_timer_runs_at_each_interval_exactly_requested_times(fake_redis, monkeypatch):
+    """Exercise the complete three-run lifecycle, including persisted progress."""
+    from fastapi.testclient import TestClient
+
+    clock = [1_800_000_000.0]
+    task = {"id": "lifecycle", "user_id": 1, "status": "active", "message": "m",
+            "groups": ["-1001"], "completed_repeats": 0, "total_repeats": 3,
+            "interval_minutes": 5, "next_run": clock[0]}
+    fake_redis.set("broadcast:task:lifecycle", json.dumps(task))
+    sends = []
+    scheduled = []
+
+    async def fake_broadcast(groups, text):
+        sends.append((clock[0], list(groups), text))
+        return {"success": len(groups), "failures": []}
+
+    monkeypatch.setattr(index.time, "time", lambda: clock[0])
+    monkeypatch.setattr(index, "broadcast_message", fake_broadcast)
+    monkeypatch.setattr(
+        index,
+        "schedule_process",
+        lambda task_id, delay, expected_repeat: scheduled.append(
+            (task_id, delay, expected_repeat)),
+    )
+    monkeypatch.setattr(index, "BOT_TOKEN", None)
+    client = TestClient(index.app)
+
+    for repeat in range(3):
+        response = client.post(
+            "/api/process",
+            json={"task_id": "lifecycle", "expected_repeat": repeat},
+            headers={"Message-Id": f"lifecycle-{repeat}"},
+        )
+        assert response.status_code == 200
+        saved = index.get_task("lifecycle")
+        assert saved["completed_repeats"] == repeat + 1
+        if repeat < 2:
+            assert saved["status"] == "active"
+            assert saved["next_run"] == clock[0] + 5 * 60
+            clock[0] = saved["next_run"]
+
+    assert sends == [
+        (1_800_000_000.0, ["-1001"], "m"),
+        (1_800_000_300.0, ["-1001"], "m"),
+        (1_800_000_600.0, ["-1001"], "m"),
+    ]
+    assert scheduled == [
+        ("lifecycle", 5, 1),
+        ("lifecycle", 5, 2),
+    ]
+    assert index.get_task("lifecycle")["status"] == "completed"
+
+
+def test_retryable_configuration_error_does_not_consume_repeat(fake_redis, monkeypatch):
+    """A temporary configuration failure must remain retryable by QStash."""
+    from fastapi.testclient import TestClient
+
+    task = {"id": "retryable", "user_id": 1, "status": "active", "message": "m",
+            "groups": ["-1001"], "completed_repeats": 0, "total_repeats": 2,
+            "interval_minutes": 5, "next_run": 0}
+    fake_redis.set("broadcast:task:retryable", json.dumps(task))
+
+    async def unavailable(*args):
+        raise index.MissingEnvError("API_ID is not configured")
+
+    monkeypatch.setattr(index, "broadcast_message", unavailable)
+    response = TestClient(index.app).post(
+        "/api/process",
+        json={"task_id": "retryable", "expected_repeat": 0},
+        headers={"Message-Id": "retryable-zero"},
+    )
+
+    assert response.status_code == 503
+    assert index.get_task("retryable")["completed_repeats"] == 0
+    assert "broadcast:processed:retryable:0" not in fake_redis.store
+    assert "broadcast:qstash_message:retryable-zero" not in fake_redis.store
+
+
 def test_cancelled_task_not_executed(fake_redis, monkeypatch):
     from fastapi.testclient import TestClient
 
