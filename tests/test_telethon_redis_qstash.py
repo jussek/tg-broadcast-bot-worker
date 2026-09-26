@@ -255,6 +255,7 @@ def test_early_delivery_waits_until_next_run(fake_redis, monkeypatch):
     monkeypatch.setattr(index, "schedule_process_in_seconds",
                         lambda task_id, delay, expected_repeat: delayed.append(
                             (task_id, delay, expected_repeat)))
+                        lambda task_id, delay: delayed.append((task_id, delay)))
 
     response = TestClient(index.app).post(
         "/api/process", json={"task_id": "early"}, headers={"Message-Id": "too-soon"})
@@ -262,6 +263,7 @@ def test_early_delivery_waits_until_next_run(fake_redis, monkeypatch):
     assert response.json()["status"] == "not_due_yet"
     assert sent == []
     assert delayed == [("early", pytest.approx(75.2), 0)]
+    assert delayed == [("early", pytest.approx(75.2))]
     assert index.get_task("early")["completed_repeats"] == 0
     assert "broadcast:processed:early:0" not in fake_redis.store
 
