@@ -72,7 +72,7 @@ CALLBACKS_WITHOUT_ARGS = [
     "new_broadcast", "write_message", "use_last_message", "last_message",
     "select_template", "select_live_groups", "select_group_list",
     "continue_to_send", "send_now", "schedule_task", "cancel", "templates",
-    "create_template", "tasks", "groups", "create_group_list",
+    "create_template", "tasks", "groups", "create_group_list", "repeats_infinite",
     "back_broadcast", "back_menu", "ignore",
 ]
 

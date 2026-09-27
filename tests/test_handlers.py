@@ -216,6 +216,32 @@ def test_active_timer_can_be_cancelled(fake_redis):
     assert len(cb.answers) >= 1
 
 
+def test_infinite_timer_can_be_created_tracked_and_cancelled(fake_redis, monkeypatch):
+    monkeypatch.setattr(index, "schedule_process", lambda *args, **kwargs: None)
+    index.set_user_state(42, {
+        "step": "waiting_for_repeats",
+        "message_text": "вечная рассылка",
+        "selected_groups": ["-1"],
+        "interval_minutes": 5,
+    })
+
+    created = run_callback("repeats_infinite")
+    tasks = index.get_user_tasks(42)
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task["total_repeats"] is None
+    assert task["status"] == "active"
+    assert "Остановить" in created.edits[-1][0]
+
+    details = run_callback(f"task_details:{task['id']}")
+    assert "Выполнено отправок: 0/∞" in details.edits[-1][0]
+    assert any("Отменить" in button.text
+               for row in details.edits[-1][1].inline_keyboard for button in row)
+
+    run_callback(f"cancel_task:{task['id']}")
+    assert index.get_task(task["id"])["status"] == "cancelled"
+
+
 def test_task_details_shows_all_fields(fake_redis):
     task = {"id": "bbbb2222-3333", "user_id": 42, "status": "active", "message": "тест текст",
             "groups": ["-1", "-2", "-3"], "interval_minutes": 15,

@@ -33,7 +33,7 @@ SET_STATE_FIELDS = {"selected", "template_group_ids", "legacy_template_chat_ids"
 class Task:
     """Scheduled broadcast task."""
     def __init__(self, id: str, user_id: int, message: str, groups: List[int],
-                 interval_minutes: int, total_repeats: int, status: str = "active",
+                 interval_minutes: int, total_repeats: Optional[int], status: str = "active",
                  completed_repeats: int = 0, created_at: float = None, next_run: float = None):
         self.id = id
         self.user_id = user_id
@@ -193,7 +193,8 @@ def _decode_state(state: dict) -> dict:
 # Task Operations
 # ============================================================================
 
-def create_task(user_id: int, message: str, groups: list, interval_minutes: int, repeats: int) -> dict:
+def create_task(user_id: int, message: str, groups: list, interval_minutes: int,
+                repeats: Optional[int]) -> dict:
     task_id = str(uuid.uuid4())
     now = time.time()
     task = {
@@ -202,7 +203,7 @@ def create_task(user_id: int, message: str, groups: list, interval_minutes: int,
         "message": message,
         "groups": [int(x) for x in groups],
         "interval_minutes": int(interval_minutes),
-        "total_repeats": int(repeats),
+        "total_repeats": None if repeats is None else int(repeats),
         "completed_repeats": 0,
         "status": "active",
         "created_at": now,
