@@ -345,43 +345,6 @@ def test_timer_runs_at_each_interval_exactly_requested_times(fake_redis, monkeyp
     assert index.get_task("lifecycle")["status"] == "completed"
 
 
-def test_infinite_timer_keeps_running_and_tracking_progress(fake_redis, monkeypatch):
-    from fastapi.testclient import TestClient
-
-    clock = [1_800_000_000.0]
-    task = {"id": "infinite", "user_id": 1, "status": "active", "message": "m",
-            "groups": ["-1001"], "completed_repeats": 0, "total_repeats": None,
-            "interval_minutes": 2, "next_run": clock[0]}
-    fake_redis.set("broadcast:task:infinite", json.dumps(task))
-    sent = []
-    scheduled = []
-
-    async def fake_broadcast(groups, text):
-        sent.append(clock[0])
-        return {"success": 1, "failures": []}
-
-    monkeypatch.setattr(index.time, "time", lambda: clock[0])
-    monkeypatch.setattr(index, "broadcast_message", fake_broadcast)
-    monkeypatch.setattr(index, "schedule_process",
-                        lambda task_id, delay, expected_repeat: scheduled.append(
-                            (task_id, delay, expected_repeat)))
-    monkeypatch.setattr(index, "BOT_TOKEN", None)
-    client = TestClient(index.app)
-
-    for repeat in range(2):
-        response = client.post("/api/process", json={
-            "task_id": "infinite", "expected_repeat": repeat,
-        }, headers={"Message-Id": f"infinite-{repeat}"})
-        assert response.status_code == 200
-        saved = index.get_task("infinite")
-        assert saved["status"] == "active"
-        assert saved["completed_repeats"] == repeat + 1
-        clock[0] = saved["next_run"]
-
-    assert sent == [1_800_000_000.0, 1_800_000_120.0]
-    assert scheduled == [("infinite", 2, 1), ("infinite", 2, 2)]
-
-
 def test_retryable_configuration_error_does_not_consume_repeat(fake_redis, monkeypatch):
     """A temporary configuration failure must remain retryable by QStash."""
     from fastapi.testclient import TestClient

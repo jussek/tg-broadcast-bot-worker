@@ -1048,8 +1048,7 @@ def _format_task_details(task: Dict[str, Any]) -> str:
         f"⏰ <b>Таймер {str(task_id)[:8]}</b>",
         f"Статус: {_task_status_label(task.get('status'))}",
         f"Интервал: {task.get('interval_minutes', 1)} мин.",
-        f"Выполнено отправок: {task.get('completed_repeats', 0)}/"
-        f"{'∞' if task.get('total_repeats') is None else task.get('total_repeats', 1)}",
+        f"Выполнено отправок: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)}",
         f"Каналов: {len(task.get('groups', []))}",
     ]
     if task.get("status") in ACTIVE_TASK_STATUSES and task.get("next_run"):
@@ -1080,8 +1079,7 @@ async def render_tasks(callback: types.CallbackQuery):
             status = {"active": "🟢", "pending": "🟡"}.get(task.get("status"), "⚪")
             header_lines.append(
                 f"{i}. {status} {tid} — выполнено "
-                f"{task.get('completed_repeats', 0)} из "
-                f"{'∞' if task.get('total_repeats') is None else task.get('total_repeats', 1)} отправок, "
+                f"{task.get('completed_repeats', 0)} из {task.get('total_repeats', 1)} отправок, "
                 f"интервал {task.get('interval_minutes', 1)} мин."
             )
     kb = []
