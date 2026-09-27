@@ -91,7 +91,8 @@ class SchedulerService:
             # Update task status
             task["completed_repeats"] = task.get("completed_repeats", 0) + 1
             
-            if task["completed_repeats"] >= task.get("total_repeats", 1):
+            total_repeats = task.get("total_repeats")
+            if total_repeats is not None and task["completed_repeats"] >= int(total_repeats):
                 task["status"] = "completed"
             else:
                 # Schedule next run
