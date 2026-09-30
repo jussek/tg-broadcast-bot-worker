@@ -722,6 +722,7 @@ async def handle_delivery(body: Dict[str, Any], *, headers: Optional[Dict[str, s
     retryable infrastructure problems (missing config), so QStash retries.
     """
     headers = headers or {}
+    delivery_terminal = False   # Message-Id may be marked seen ONLY on a terminal outcome
     task_id = _as_str(body.get("task_id") or "")
     if not task_id:
         raise ValueError("No task_id")
@@ -742,9 +743,22 @@ async def handle_delivery(body: Dict[str, Any], *, headers: Optional[Dict[str, s
         except Exception:
             logger.exception("Message-Id dedupe check failed; continuing")
 
-    task_raw = _loads(redis_client.get_redis().get(task_key(task_id)) or "")
+    raw_value = redis_client.get_redis().get(task_key(task_id))
+    if raw_value is None:
+        # Redis ABSENT key -> terminal "not found".  The Message-Id marker is
+        # written (delivery_terminal) so the delivery cannot loop forever
+        # against a task that does not exist.
+        result = {"ok": False, "error": "Task not found"}
+        delivery_terminal = True
+        return result
+    # Key EXISTS but may hold "" / malformed JSON -> _loads surfaces
+    # JSONDecodeError (never masked via try/except): a corrupt record is a
+    # different situation from an absent one.
+    task_raw = _loads(raw_value)
     if not task_raw:
-        return {"ok": False, "error": "Task not found"}
+        result = {"ok": False, "error": "Task not found"}
+        delivery_terminal = True
+        return result
     task = normalize_task(task_raw)
 
     # 2) legacy payloads carry no repeat number: bind them to the current
@@ -758,21 +772,27 @@ async def handle_delivery(body: Dict[str, Any], *, headers: Optional[Dict[str, s
             raise ValueError("Invalid repeat_no")
 
     if task.get("status") not in ACTIVE_STATUSES:
+        delivery_terminal = True
         return {"ok": True, "status": "inactive_or_missing"}
     if repeat_no < int(task.get("completed_repeats", 0)):
+        delivery_terminal = True
         return {"ok": True, "status": "stale_delivery"}
     if task.get("total_repeats") is not None and repeat_no >= int(task["total_repeats"]):
+        delivery_terminal = True
         return {"ok": True, "status": "stale_delivery"}
 
     run = ensure_run(task, repeat_no)
     if run is None:
         # Concurrent creation won the race; retry shortly (the run will exist).
         _requeue_batch(task_id, repeat_no, batch_no, 5)
+        delivery_terminal = True   # safely requeued — terminal for THIS delivery
         return {"ok": True, "status": "run_contended"}
     if batch_no < 0 or batch_no >= len(run["batches"]):
+        delivery_terminal = True
         return {"ok": True, "status": "stale_delivery"}
     if run.get("status") == "completed":
         commit_repeat(task, run)
+        delivery_terminal = True
         return {"ok": True, "status": "already_completed"}
 
     interval = int(task.get("interval_seconds") or task.get("interval_minutes", 1) * 60)
@@ -782,12 +802,18 @@ async def handle_delivery(body: Dict[str, Any], *, headers: Optional[Dict[str, s
     now = time.time()
     if due > now + 1:
         _requeue_batch(task_id, repeat_no, batch_no, due - now)
+        delivery_terminal = True   # explicitly requeued — terminal for THIS delivery
         return {"ok": True, "status": "not_due_yet"}
 
     # 4) concurrency lease for this exact batch (retry/replay/manual overlap)
     lk = lease_key(task_id, repeat_no, batch_no)
     token = acquire_lease(lk, ttl=interval + 120)
     if token is None:
+        # Another worker owns the batch right now.  This delivery is safely
+        # finished (its work is covered elsewhere), but we deliberately do NOT
+        # mark the Message-Id seen: a later redelivery of the same message can
+        # still perform the idempotent completion check (commit_repeat) once
+        # the winner finishes.  Re-checks are cheap and duplicate-free.
         return {"ok": True, "status": "already_processing"}
 
     try:
@@ -805,9 +831,11 @@ async def handle_delivery(body: Dict[str, Any], *, headers: Optional[Dict[str, s
             wait = min(int(summary["flood_wait"]) + 2, 24 * 3600)
             _requeue_batch(task_id, repeat_no, batch_no, wait,
                            dedup_id=f"{task_id}:{repeat_no}:{batch_no}:fw:{time.time():.0f}")
+            delivery_terminal = True   # explicitly requeued — terminal for THIS delivery
             return {"ok": True, "status": "flood_wait_rescheduled", "wait_seconds": wait}
 
         if summary.get("cancelled"):
+            delivery_terminal = True
             return {"ok": True, "status": "cancelled"}
 
         if summary.get("budget_exhausted") or summary.get("retryable_failed"):
@@ -815,6 +843,7 @@ async def handle_delivery(body: Dict[str, Any], *, headers: Optional[Dict[str, s
             # backoff.  Already-sent groups are skipped via their markers, so
             # this neither duplicates nor loses sends.
             _requeue_batch(task_id, repeat_no, batch_no, RETRY_BACKOFF_SECONDS)
+            delivery_terminal = True   # explicitly requeued — terminal for THIS delivery
             return {"ok": True, "status": "batch_incomplete_requeued",
                     "success": summary["success"], "retryable": summary["retryable_failed"]}
 
@@ -825,19 +854,29 @@ async def handle_delivery(body: Dict[str, Any], *, headers: Optional[Dict[str, s
             _requeue_batch(task_id, repeat_no, next_batch, 1)
             if notifier and summary.get("results"):
                 await notifier(task, summary)
+            delivery_terminal = True
             return {"ok": True, "status": "batch_done", "success": summary["success"],
                     "failed": summary["permanent_failed"], "next_batch": next_batch}
 
         task = commit_repeat(task, run)
         if notifier and summary.get("results"):
             await notifier(task, summary)
+        delivery_terminal = True
         return {"ok": True, "status": "repeat_committed",
                 "completed_repeats": task["completed_repeats"],
                 "task_status": task["status"],
                 "success": summary["success"], "failed": summary["permanent_failed"]}
     finally:
         release_lease(lk, token)
-        if message_id:
+        # Message-Id dedupe marker semantics (external review item 9): the
+        # marker means "this delivery reached a terminal or safely-requeued
+        # state".  It is written ONLY when delivery_terminal is True.  On any
+        # raised/retryable infrastructure path (MissingEnvError -> 503, Redis
+        # outage, Telethon connect timeout -> 5xx) it stays ABSENT, so QStash
+        # provider retries can re-run the delivery without being swallowed as
+        # "duplicate".  A crash after confirms but before this marker is also
+        # safe: per-send markers make the redelivery duplicate-free.
+        if message_id and delivery_terminal:
             try:
                 redis_client.get_redis().set(message_dedupe_key(message_id), "1", ex=DEDUPE_TTL)
             except Exception:

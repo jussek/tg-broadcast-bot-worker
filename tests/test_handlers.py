@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / 'api'))
 import pytest
 
 import index as index
+from services import broadcast_runner
 
 
 class FakeRedis:
@@ -124,11 +125,26 @@ def run_callback(callback_data, user_id=42):
 
 # --------------------------------------------------------------------- locks
 def test_task_lock_accepts_upstash_success_response(fake_redis):
+    """acquire_task_lock intentionally returns an OWNER TOKEN (not bool) so
+    that release is compare-and-delete — a worker must never delete a lock
+    that expired and was re-acquired by someone else."""
     from storage.models import acquire_task_lock, release_task_lock
-    assert acquire_task_lock("t9") is True
-    assert acquire_task_lock("t9") is False  # second caller must not proceed
-    release_task_lock("t9")
-    assert acquire_task_lock("t9") is True
+
+    token = acquire_task_lock("t9")
+    assert isinstance(token, str)
+    assert token
+
+    # second caller must not proceed
+    assert acquire_task_lock("t9") is None
+
+    # a foreign token must NOT release the lock
+    release_task_lock("t9", "deadbeef" * 4)
+    assert acquire_task_lock("t9") is None  # still locked
+
+    # the real owner can release it
+    release_task_lock("t9", token)
+    token2 = acquire_task_lock("t9")
+    assert isinstance(token2, str) and token2
 
 
 # ------------------------------------------------------------------ menus
@@ -194,13 +210,23 @@ def test_toggle_then_continue_reaches_send_menu(fake_redis):
 
 # ------------------------------------------------------------------- tasks
 def test_scheduled_task_records_next_run(fake_redis, monkeypatch):
-    monkeypatch.setattr(index, "schedule_process", lambda *a, **k: None)
+    # legacy index.schedule_process was intentionally removed; the real
+    # planning point is services.broadcast_runner.publish_delivery (called
+    # via schedule_first_batch inside create_timer_task).
+    published = []
+    monkeypatch.setattr(broadcast_runner, "publish_delivery",
+                        lambda body, **kw: published.append((body, kw)))
     state = {"message_text": "hi", "selected_groups": ["-1001"], "interval_minutes": 10, "total_repeats": 4}
     task_id = asyncio.run(index.create_and_schedule_task(42, state))
     task = index.get_task(task_id)
     assert task["next_run"] > task["created_at"]
+    assert task["next_run"] == pytest.approx(task["first_run_at"])
+    assert task["first_run_at"] == pytest.approx(task["created_at"] + 600)
     assert task["interval_minutes"] == 10
     assert task["total_repeats"] == 4
+    # exactly ONE initial delivery: repeat_no=0, batch_no=0
+    assert len(published) == 1
+    assert published[0][0] == {"task_id": task_id, "repeat_no": 0, "batch_no": 0}
 
 
 def test_active_timer_can_be_cancelled(fake_redis):
@@ -217,7 +243,11 @@ def test_active_timer_can_be_cancelled(fake_redis):
 
 
 def test_infinite_timer_can_be_created_tracked_and_cancelled(fake_redis, monkeypatch):
-    monkeypatch.setattr(index, "schedule_process", lambda *args, **kwargs: None)
+    # legacy index.schedule_process was intentionally removed; patch the real
+    # planning point in services.broadcast_runner instead.
+    published = []
+    monkeypatch.setattr(broadcast_runner, "publish_delivery",
+                        lambda body, **kw: published.append((body, kw)))
     index.set_user_state(42, {
         "step": "waiting_for_repeats",
         "message_text": "вечная рассылка",
@@ -231,15 +261,37 @@ def test_infinite_timer_can_be_created_tracked_and_cancelled(fake_redis, monkeyp
     task = tasks[0]
     assert task["total_repeats"] is None
     assert task["status"] == "active"
-    assert "Остановить" in created.edits[-1][0]
+    assert len(published) == 1  # exactly one initial delivery
+    assert "Остановить" in created.edits[-1][0] or "Мои таймеры" in created.edits[-1][0]
 
     details = run_callback(f"task_details:{task['id']}")
-    assert "Выполнено отправок: 0/∞" in details.edits[-1][0]
+    body = details.edits[-1][0]
+    assert "Выполнено циклов рассылки: 0 циклов" in body
+    assert "Повторений: ∞" in body
     assert any("Отменить" in button.text
                for row in details.edits[-1][1].inline_keyboard for button in row)
 
     run_callback(f"cancel_task:{task['id']}")
     assert index.get_task(task["id"])["status"] == "cancelled"
+
+    # a later (already-planned) QStash delivery for the cancelled task must
+    # not send anything: handle_delivery returns inactive_or_missing.
+    sent = []
+
+    async def recording_sender(client, gid, text):
+        sent.append(gid)
+        return "sent"
+
+    old_sender = broadcast_runner._default_sender
+    broadcast_runner._default_sender = recording_sender
+    try:
+        result = asyncio.run(broadcast_runner.handle_delivery(
+            {"task_id": task["id"], "repeat_no": 0, "batch_no": 0},
+            headers={}, client_factory=object()))
+    finally:
+        broadcast_runner._default_sender = old_sender
+    assert result.get("status") == "inactive_or_missing"
+    assert sent == []
 
 
 def test_task_details_shows_all_fields(fake_redis):
@@ -249,7 +301,8 @@ def test_task_details_shows_all_fields(fake_redis):
     index.save_task(task)
     cb = run_callback(f"task_details:{task['id']}")
     body = cb.edits[-1][0]
-    for fragment in ("Таймер", "Статус", "Интервал", "Выполнено отправок: 1/5", "Каналов: 3", "До запуска", "Следующий запуск"):
+    for fragment in ("Таймер", "Статус", "Интервал", "Выполнено циклов рассылки: 1 из 5",
+                     "Повторений: 5", "Групп выбрано: 3", "До запуска", "Следующий запуск"):
         assert fragment in body, f"missing {fragment!r} in task details"
     markup = cb.edits[-1][1]
     cancel_buttons = [b for row in markup.inline_keyboard for b in row if "Отменить" in b.text]
