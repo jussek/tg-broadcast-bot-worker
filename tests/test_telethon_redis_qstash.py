@@ -95,11 +95,14 @@ def test_get_telethon_client_requires_env(monkeypatch):
 
 
 def test_get_telethon_client_unauthorized_disconnects(monkeypatch):
+    import services.telegram_delivery as td
+
     class FakeTelethon:
+        connected = False
         disconnected = False
 
         async def connect(self):
-            pass
+            FakeTelethon.connected = True
 
         async def is_user_authorized(self):
             return False
@@ -107,13 +110,16 @@ def test_get_telethon_client_unauthorized_disconnects(monkeypatch):
         async def disconnect(self):
             FakeTelethon.disconnected = True
 
-    monkeypatch.setattr(index, "API_ID", None)
-    monkeypatch.setattr(index, "API_HASH", "hash")
-    monkeypatch.setattr(index, "TELEGRAM_SESSION_STRING", "session")
-    monkeypatch.setattr(index, "get_telethon_client_factory", lambda: FakeTelethon())
+    # Env vars are read via os.getenv() inside get_telethon_client_factory —
+    # patch ENV (dummy values, no real secrets), and inject the fake client.
+    monkeypatch.setenv("API_ID", "12345")
+    monkeypatch.setenv("API_HASH", "test-hash")
+    monkeypatch.setenv("TELEGRAM_SESSION_STRING", "test-session")
+    monkeypatch.setattr(td, "get_telethon_client_factory", lambda: FakeTelethon())
 
-    with pytest.raises(index.SessionNotAuthorizedError):
-        asyncio.run(index.get_telethon_client())
+    with pytest.raises(td.SessionNotAuthorizedError):
+        asyncio.run(td.get_telethon_client())
+    assert FakeTelethon.connected is True
     assert FakeTelethon.disconnected is True
 
 
@@ -212,10 +218,16 @@ def test_early_delivery_waits_until_next_run(fake_redis, monkeypatch, spy_publis
         "/api/process", json={"task_id": "early", "repeat_no": 0, "batch_no": 0},
         headers={"Message-Id": "too-soon"})
 
-    assert response.json()["status"] == "not_due_yet"
+    result = response.json()
+    assert result["status"] == "not_due_yet"
     assert sent == []
+    # exactly one requeue of the SAME batch
     assert spy_publisher.batches == [("early", 0, 0)]
-    assert 74 < spy_publisher.calls[0]["delay_seconds"] <= 75.2
+    delay_seconds = spy_publisher.calls[0]["delay_seconds"]
+    # tolerance-based check: normalize_delay rounds UP to whole seconds and
+    # mocked vs real clock may differ by float noise — no strict upper bound
+    # at the exact float value (75.2 vs 75.200000047 must both pass).
+    assert 74 < delay_seconds < 77
     assert index.get_task("early")["completed_repeats"] == 0
     assert "broadcast:processed:early:0" not in fake_redis.store
 
