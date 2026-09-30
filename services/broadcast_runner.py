@@ -744,18 +744,18 @@ async def handle_delivery(body: Dict[str, Any], *, headers: Optional[Dict[str, s
             logger.exception("Message-Id dedupe check failed; continuing")
 
     raw_value = redis_client.get_redis().get(task_key(task_id))
-    if not raw_value:
-        # Missing record and corrupt JSON are different situations: only the
-        # absent value is answered as a terminal "not found"; corrupt JSON is
-        # surfaced (never masked via try/except).
-        task_raw = None
-    else:
-        task_raw = _loads(raw_value)
+    if raw_value is None:
+        # Redis ABSENT key -> terminal "not found".  The Message-Id marker is
+        # written (delivery_terminal) so the delivery cannot loop forever
+        # against a task that does not exist.
+        result = {"ok": False, "error": "Task not found"}
+        delivery_terminal = True
+        return result
+    # Key EXISTS but may hold "" / malformed JSON -> _loads surfaces
+    # JSONDecodeError (never masked via try/except): a corrupt record is a
+    # different situation from an absent one.
+    task_raw = _loads(raw_value)
     if not task_raw:
-        # Pre-existing semantics kept unchanged (external review): a missing
-        # record is answered as a terminal "not found" for this payload.  It
-        # IS marked terminal below, so the Message-Id marker is written — the
-        # delivery cannot loop forever against an absent task.
         result = {"ok": False, "error": "Task not found"}
         delivery_terminal = True
         return result
