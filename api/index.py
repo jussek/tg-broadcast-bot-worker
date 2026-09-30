@@ -2,9 +2,10 @@
 
 Architecture (serverless-safe):
   Telegram -> POST /api/webhook -> Update -> Dispatcher (single, module-level)
-           -> callback/message handlers -> service layer -> Redis (state/cache)
-                                                        -> Telethon (MTProto)
-  QStash   -> POST /api/process  -> broadcast runner (locks + idempotency)
+           -> callback/message handlers -> services/broadcast_runner (engine)
+                                        -> storage/redis (state/tasks/runs)
+  QStash   -> POST /api/process  -> ONE short batch of sends per invocation
+             (never a full broadcast; never asyncio.sleep for intervals)
 
 Important rules enforced here:
   * setWebhook is NEVER called during app startup (it caused Telegram flood
@@ -13,9 +14,14 @@ Important rules enforced here:
   * The aiogram Bot session is closed after every webhook invocation to avoid
     "Unclosed client session / Unclosed connector" warnings in serverless.
   * All user/broadcast state lives in Redis, not in process memory.
+  * Immediate broadcast and timer broadcast share ONE delivery engine
+    (services.broadcast_runner) — they differ only in due_at.
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import html
 import json
 import logging
@@ -45,19 +51,6 @@ from aiogram.fsm.storage.base import BaseStorage
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Update
 
-from telethon import TelegramClient
-from telethon.errors import (
-    ChannelPrivateError,
-    ChatWriteForbiddenError,
-    FloodWaitError,
-    PeerIdInvalidError,
-    RPCError,
-    UserBannedInChannelError,
-)
-from telethon.sessions import StringSession
-
-from qstash import QStash
-
 # Configure logging before anything else can use it during import.
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -81,28 +74,38 @@ if not IS_VERCEL_ENV and not all([BOT_TOKEN, API_ID, API_HASH, TELEGRAM_SESSION_
     )
 
 
-class MissingEnvError(RuntimeError):
-    """Raised when a required environment variable is not configured."""
-
-
-def _require_env(value: Optional[str], name: str) -> str:
-    if not value:
-        raise MissingEnvError(f"{name} is not configured")
-    return value
-
-
 # ============================================================================
-# Storage layer — single Redis implementation (storage/redis_client + models)
+# Unified delivery engine — SINGLE source of truth for scheduling & sending.
+# Handlers below are thin UI wrappers around these functions.
 # ============================================================================
+from services import broadcast_runner  # noqa: E402
+from services.broadcast_runner import (  # noqa: E402
+    BATCH_SIZE,
+    MissingEnvError,
+    SessionNotAuthorizedError,
+    create_immediate_run,
+    create_timer_task,
+    format_duration,
+    handle_delivery,
+    normalize_task,
+)
+from services.telegram_delivery import (  # noqa: E402
+    TELETHON_FETCH_TIMEOUT,
+    fetch_dialogs_with_timeout,
+    fetch_user_dialogs,
+    get_telethon_client,
+    get_telethon_client_factory,
+    connect_authorized_client,
+)
+from telethon import TelegramClient  # noqa: E402  (type hints only)
+
 from storage.redis_client import get_redis  # noqa: E402
 from storage.models import (  # noqa: E402
     _loads,
-    acquire_task_lock,
     clear_user_state as _models_clear_user_state,
     get_last_message as _models_get_last_message,
     get_task,
     get_user_state as _models_get_user_state,
-    release_task_lock,
     save_last_message as _models_save_last_message,
     save_task,
 )
@@ -240,158 +243,18 @@ def save_groups_cache(user_id: int, groups: List[Dict[str, str]], ttl: int = 864
 
 
 # ============================================================================
-# Service layer — Telethon (user MTProto API)
-# ============================================================================
-class SessionNotAuthorizedError(RuntimeError):
-    """Telethon session exists but is not authorized for a user account."""
-
-
-def get_telethon_client_factory():
-    """Construct a (not yet connected) TelegramClient for this invocation.
-
-    Env vars are re-read on every call so tests and credential rotations take
-    effect without re-importing the module.  Split out from connecting so the
-    lifecycle (connect / authorize / disconnect) is independently testable.
-    """
-    api_id = int(_require_env(os.getenv("API_ID") or API_ID, "API_ID"))
-    api_hash = _require_env(os.getenv("API_HASH") or API_HASH, "API_HASH")
-    session = _require_env(
-        os.getenv("TELEGRAM_SESSION_STRING") or TELEGRAM_SESSION_STRING,
-        "TELEGRAM_SESSION_STRING",
-    )
-    return TelegramClient(StringSession(session), api_id, api_hash)
-
-
-async def connect_authorized_client(client: TelegramClient) -> TelegramClient:
-    """Connect a client and verify it belongs to an authorized account."""
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            raise SessionNotAuthorizedError(
-                "Telegram user session is not authorized. "
-                "Пересоздайте TELEGRAM_SESSION_STRING на авторизованном устройстве."
-            )
-    except Exception:
-        try:
-            await client.disconnect()
-        except Exception:
-            logger.exception("Failed to disconnect Telethon client after error")
-        raise
-    return client
-
-
-async def get_telethon_client() -> TelegramClient:
-    """Create a connected, authorized Telethon client for this invocation."""
-    return await connect_authorized_client(get_telethon_client_factory())
-
-
-async def fetch_user_dialogs(client: TelegramClient) -> List[Dict[str, str]]:
-    """Iterate ALL dialogs (no artificial limit); normalize groups/channels."""
-    dialogs: List[Dict[str, str]] = []
-    async for dialog in client.iter_dialogs():
-        if dialog.is_group or dialog.is_channel:
-            dialogs.append({"id": str(dialog.id), "title": dialog.title or dialog.name or str(dialog.id)})
-    return dialogs
-
-
-async def broadcast_message(groups: List[str], text: str) -> Dict[str, Any]:
-    """Send ``text`` to every group id; one failure never stops the rest."""
-    client = await get_telethon_client()
-    success = 0
-    failures: List[Dict[str, str]] = []
-    try:
-        # A chat can occur more than once after combining a saved list with a
-        # manual selection (and old tasks may already contain duplicates).
-        # Telegram has no request-level idempotency key for these sends, so
-        # normalize and de-duplicate ids before making any network calls.
-        unique_groups = list(dict.fromkeys(str(gid) for gid in groups))
-        for gid in unique_groups:
-            try:
-                entity = await client.get_entity(int(gid))
-                await client.send_message(entity, text, parse_mode="html")
-                success += 1
-            except (ChatWriteForbiddenError, UserBannedInChannelError):
-                logger.exception("No write access to %s", gid)
-                failures.append({"id": str(gid), "error": "Нет прав на отправку (бан/запрет)"})
-            except ChannelPrivateError:
-                logger.exception("Channel %s is private/inaccessible", gid)
-                failures.append({"id": str(gid), "error": "Канал приватный или недоступен"})
-            except PeerIdInvalidError:
-                logger.exception("Peer id invalid for %s", gid)
-                failures.append({"id": str(gid), "error": "Не удалось найти чат по ID"})
-            except FloodWaitError as exc:
-                logger.exception("FloodWait while sending to %s (wait %ss)", gid, exc.seconds)
-                failures.append({"id": str(gid), "error": f"FloodWait: пауза {exc.seconds} сек."})
-                # A failure for one target must not cancel the rest of this
-                # timer run. Record it and continue with the other chats.
-            except (ValueError, TypeError):
-                logger.exception("Malformed group id %r", gid)
-                failures.append({"id": str(gid), "error": "Некорректный ID группы"})
-            except RPCError:
-                logger.exception("Telegram RPC error while sending to %s", gid)
-                failures.append({"id": str(gid), "error": "Ошибка Telegram API"})
-            await asyncio.sleep(0.3)  # gentle pacing between sends
-    finally:
-        try:
-            await client.disconnect()
-        except Exception:
-            logger.exception("Failed to disconnect Telethon client")
-    return {"success": success, "failures": failures}
-
-
-# ============================================================================
-# Service layer — QStash scheduler
-# ============================================================================
-_qstash_client: Optional[QStash] = None
-
-
-def get_qstash() -> QStash:
-    global _qstash_client
-    if _qstash_client is None:
-        _require_env(os.getenv("QSTASH_TOKEN"), "QSTASH_TOKEN")
-        _qstash_client = QStash(token=os.environ["QSTASH_TOKEN"])
-    return _qstash_client
-
-
-def schedule_process(task_id: str, delay_minutes: int, expected_repeat: int = 0):
-    """Publish a delayed delivery of the task to /api/process via QStash."""
-    get_qstash().message.publish_json(
-        url=f"{APP_URL}/api/process",
-        body={"task_id": task_id, "expected_repeat": int(expected_repeat)},
-        delay=f"{int(delay_minutes)}m",
-    )
-
-
-def schedule_process_in_seconds(task_id: str, delay_seconds: float, expected_repeat: int):
-    """Publish a delivery using the remaining wall-clock delay.
-
-    QStash delays are relative.  This variant is used when QStash calls the
-    endpoint before the persisted ``next_run`` timestamp (for example after a
-    clock skew or a manually replayed request), so rounding to whole minutes
-    cannot make a timer run early.
-    """
-    seconds = max(1, math.ceil(delay_seconds))
-    get_qstash().message.publish_json(
-        url=f"{APP_URL}/api/process",
-        body={"task_id": task_id, "expected_repeat": int(expected_repeat)},
-        delay=f"{seconds}s",
-    )
-
-
-# ============================================================================
 # aiogram Bot / Dispatcher (single instance, single handler registry)
 # ============================================================================
 def create_bot() -> Bot:
-    token = _require_env(BOT_TOKEN, "BOT_TOKEN")
+    token = os.getenv("BOT_TOKEN") or BOT_TOKEN
+    if not token:
+        raise MissingEnvError("BOT_TOKEN is not configured")
     return Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 
 dp = Dispatcher(storage=_build_fsm_storage())
 
 ACTIVE_TASK_STATUSES = ("active", "pending")
-
-# Max seconds to wait for Telethon to fetch the dialog list before giving up.
-TELETHON_FETCH_TIMEOUT = float(os.environ.get("TELETHON_FETCH_TIMEOUT", "25"))
 
 
 async def safe_answer(callback: types.CallbackQuery, text: Optional[str] = None, **kwargs):
@@ -522,34 +385,21 @@ def parse_positive_integer(value: Optional[str]) -> Optional[int]:
 
 
 async def create_and_schedule_task(user_id: int, state: Dict[str, Any]) -> str:
-    """Persist a broadcast task and publish its first QStash delivery."""
-    interval_minutes = int(state["interval_minutes"])
-    total_repeats = state.get("total_repeats")
-    if total_repeats is not None:
-        total_repeats = int(total_repeats)
-    task_id = str(uuid.uuid4())
-    task_data = {
-        "id": task_id,
-        "user_id": int(user_id),
-        "message": state["message_text"],
-        "groups": list(dict.fromkeys(str(gid) for gid in state["selected_groups"])),
-        "interval_minutes": interval_minutes,
-        "completed_repeats": 0,
-        "total_repeats": total_repeats,
-        "status": "active",
-        "created_at": time.time(),
-        "next_run": time.time() + interval_minutes * 60,
-    }
-    save_task(task_data)
-    get_redis().sadd(f"broadcast:user:{user_id}:tasks", task_id)
+    """Persist a broadcast task and publish its first QStash delivery.
 
-    try:
-        schedule_process(task_id, interval_minutes, expected_repeat=0)
-    except Exception:
-        task_data["status"] = "error"
-        save_task(task_data)
-        raise
-    return task_id
+    Thin UI wrapper around the unified engine (services.broadcast_runner) —
+    timers start ONE FULL INTERVAL after creation, matching the promise made
+    to the user in the confirmation message.
+    """
+    task = create_timer_task(
+        user_id=user_id,
+        message=state["message_text"],
+        groups=[str(gid) for gid in state["selected_groups"]],
+        interval_minutes=int(state["interval_minutes"]),
+        total_repeats=(None if state.get("total_repeats") is None
+                       else int(state["total_repeats"])),
+    )
+    return task["id"]
 
 
 def is_infinite_repeats(value: Optional[str]) -> bool:
@@ -871,26 +721,37 @@ async def cb_continue_to_send(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "send_now")
 async def cb_send_now(callback: types.CallbackQuery):
+    """Immediate broadcast via the SAME delivery engine as timers.
+
+    The webhook request must never perform the actual sends (a large group
+    list would blow past Telegram's webhook timeout and Vercel limits): we
+    create a one-shot task with due_at = now, let the engine plan its QStash
+    batches and answer the user immediately.  Per-group results arrive as a
+    notification from the runner after each batch is executed.
+    """
     user_id = callback.from_user.id
     try:
         state = get_user_state(user_id) or {}
         msg_text = state.get("message_text")
-        groups = state.get("selected_groups", [])
+        groups = [str(gid) for gid in state.get("selected_groups", [])]
         if not msg_text or not groups:
             await safe_answer(callback, "Ошибка данных: нет сообщения или групп.", show_alert=True)
             return
 
-        await safe_edit(callback, "⏳ Отправка...")
+        # Answer the callback FIRST — everything below is network I/O.
         await safe_answer(callback)
 
-        result = await broadcast_message(groups, msg_text)
+        task = create_immediate_run(user_id=user_id, message=msg_text, groups=groups)
         save_last_message(user_id, msg_text)
         clear_user_state(user_id)
-
-        lines = [f"✅ Рассылка завершена\n\n📨 Успешно: {result['success']}\n❌ Ошибок: {len(result['failures'])}"]
-        for failure in result["failures"][:10]:
-            lines.append(f"• {failure['id']}: {failure['error']}")
-        await safe_edit(callback, "\n".join(lines), main_menu_keyboard())
+        await safe_edit(
+            callback,
+            f"🚀 Рассылка запущена через надёжную очередь доставки.\n\n"
+            f"Задача <code>{task['id'][:8]}</code>: {len(groups)} групп, "
+            f"отправка стартовала сейчас. Результаты придут отдельным сообщением "
+            f"после выполнения каждой группы.",
+            main_menu_keyboard(),
+        )
     except MissingEnvError as exc:
         logger.error("Broadcast blocked: %s", exc)
         await safe_edit(callback, f"⛔ {exc}. Настройте переменные окружения.")
@@ -1043,21 +904,33 @@ def _task_status_label(status: str) -> str:
 
 
 def _format_task_details(task: Dict[str, Any]) -> str:
-    task_id = task.get("id") or task.get("task_id") or "?"
+    task = normalize_task(dict(task))
+    task_id = task.get("id") or "?"
+    total = task.get("total_repeats")
+    done = int(task.get("completed_repeats", 0))
+    repeats_label = "∞" if total is None else str(total)
+    cycles_label = f"{done} циклов" if total is None else f"{done} из {total}"
     lines = [
         f"⏰ <b>Таймер {str(task_id)[:8]}</b>",
         f"Статус: {_task_status_label(task.get('status'))}",
         f"Интервал: {task.get('interval_minutes', 1)} мин.",
-        f"Выполнено отправок: {task.get('completed_repeats', 0)}/{task.get('total_repeats', 1)}",
-        f"Каналов: {len(task.get('groups', []))}",
+        f"Выполнено циклов рассылки: {cycles_label}",
+        f"Повторений: {repeats_label}",
+        f"Групп выбрано: {len(task.get('groups', []))}",
     ]
     if task.get("status") in ACTIVE_TASK_STATUSES and task.get("next_run"):
         next_run = float(task["next_run"])
         remaining = max(0, math.ceil(next_run - time.time()))
-        minutes, seconds = divmod(remaining, 60)
-        lines.append(f"До запуска: {minutes} мин. {seconds:02d} сек.")
+        lines.append(f"До запуска: {format_duration(remaining)}")
         lines.append(f"Следующий запуск: {time.strftime('%d.%m.%Y %H:%M:%S UTC', time.gmtime(next_run))}")
-    message_preview = (task.get("message") or "").strip().replace("\n", " ")
+    if task.get("last_run_at"):
+        lines.append(
+            f"Последний запуск: {time.strftime('%d.%m.%Y %H:%M:%S UTC', time.gmtime(float(task['last_run_at'])))}"
+            f" — успешно {int(task.get('last_run_success') or 0)}, ошибок {int(task.get('last_run_failed') or 0)}"
+        )
+    if task.get("last_error"):
+        lines.append(f"Последняя ошибка: <i>{html.escape(str(task['last_error']))}</i>")
+    message_preview = html.unescape((task.get("message") or "")).strip().replace("\n", " ")
     if message_preview:
         if len(message_preview) > 120:
             message_preview = message_preview[:120] + "…"
@@ -1075,12 +948,22 @@ async def render_tasks(callback: types.CallbackQuery):
     else:
         header_lines.append(f"\nАктивных таймеров: {len(tasks)}\n")
         for i, task in enumerate(tasks, 1):
-            tid = str(task.get("id") or task.get("task_id") or "?")[:8]
+            tid = str(task.get("id") or "?")[:8]
             status = {"active": "🟢", "pending": "🟡"}.get(task.get("status"), "⚪")
+            done = int(task.get("completed_repeats") or 0)
+            total = task.get("total_repeats")
+            progress = f"{done} циклов" if total is None else f"{done} из {int(total)}"
+            last = task.get("last_run_at")
+            last_line = ""
+            if last:
+                last_line = (f" | последний запуск "
+                             f"{time.strftime('%d.%m %H:%M UTC', time.gmtime(float(last)))}"
+                             f" ✅{int(task.get('last_run_success') or 0)}"
+                             f" ❌{int(task.get('last_run_failed') or 0)}")
             header_lines.append(
-                f"{i}. {status} {tid} — выполнено "
-                f"{task.get('completed_repeats', 0)} из {task.get('total_repeats', 1)} отправок, "
-                f"интервал {task.get('interval_minutes', 1)} мин."
+                f"{i}. {status} {tid} — выполнено {progress} рассылки, "
+                f"интервал {task.get('interval_minutes', 1)} мин., "
+                f"групп {len(task.get('groups') or [])}{last_line}"
             )
     kb = []
     for task in tasks:
@@ -1344,28 +1227,29 @@ async def health_check():
     }
 
 
-def _check_qstash_signature(request: Request, signature: Optional[str]) -> bool:
-    """Best-effort QStash signed-delivery verification.
+def _check_qstash_signature(raw_body: bytes, signature: Optional[str]) -> bool:
+    """QStash signed-delivery verification (current v1 format).
 
-    Returns True when verification is not configured (legacy deployments),
-    otherwise validates the current verified-delivery format.
+    Signature header looks like ``t=1727689145,v1=<base64>,v1=<base64>`` and
+    signs ``"{timestamp}.{raw request body}"`` with HMAC-SHA256 using the base64
+    verification key.  Returns True when verification is not configured
+    (legacy deployments / local testing), otherwise validates strictly.
     """
     if not QSTASH_VERIFICATION_KEY:
         return True
     if not signature:
         return False
     try:
-        import base64
-        import hmac
-        import hashlib
-
-        parts = signature.split(",")
+        parts = [p.strip() for p in signature.split(",")]
         timestamp = next(p.split("=", 1)[1] for p in parts if p.startswith("t="))
         signatures = [p.split("=", 1)[1] for p in parts if p.startswith("v1=")]
-        signed_body = f"{timestamp}.{request['url'].path}".encode()
+        if not signatures:
+            return False
+        signing_key = base64.b64decode(QSTASH_VERIFICATION_KEY)
+        signed_body = f"{timestamp}.".encode() + raw_body
         for candidate in signatures:
             expected = base64.b64encode(
-                hmac.new(base64.b64decode(QSTASH_VERIFICATION_KEY), signed_body, hashlib.sha256).digest()
+                hmac.new(signing_key, signed_body, hashlib.sha256).digest()
             ).decode()
             if hmac.compare_digest(expected, candidate):
                 return True
@@ -1373,6 +1257,90 @@ def _check_qstash_signature(request: Request, signature: Optional[str]) -> bool:
     except Exception:
         logger.exception("QStash signature verification failed")
         return False
+
+
+async def notify_user(task: Dict[str, Any], summary: Dict[str, Any]) -> None:
+    """Send per-batch results to the task owner (best effort, never raises)."""
+    bot_token = os.getenv("BOT_TOKEN") or BOT_TOKEN
+    if not bot_token:
+        return
+    problem = [r for r in summary.get("results", []) if r.get("status") != "sent"]
+    if not problem:
+        return
+    labels = {
+        "no_write_permission": "нет прав на отправку",
+        "admin_required": "требуются права администратора",
+        "inaccessible": "группа недоступна",
+        "invalid_group_id": "некорректный ID группы",
+        "flood_wait": "FloodWait",
+        "timeout": "таймаут",
+        "telegram_error": "ошибка Telegram API",
+        "max_attempts_exceeded": "превышено число попыток",
+    }
+    bot = None
+    try:
+        bot = create_bot()
+        lines = [f"• {r['group_id']}: {labels.get(r['status'], r['status'])}" for r in problem[:10]]
+        await bot.send_message(
+            int(task["user_id"]),
+            "⚠️ Часть рассылки не отправлена (цикл %s):\n%s"
+            % (int(task.get("completed_repeats", 0)), "\n".join(lines)),
+        )
+    except Exception:
+        logger.exception("Failed to notify user %s about send errors", task.get("user_id"))
+    finally:
+        if bot is not None:
+            try:
+                await bot.session.close()
+            except Exception:
+                logger.exception("Bot session close failed")
+
+
+@app.post("/api/process")
+async def process_task(request: Request):
+    """QStash-triggered execution of ONE batch of ONE repeat.
+
+    This endpoint is a thin HTTP adapter over services.broadcast_runner —
+    the single delivery engine shared by timers and immediate sends.  Each
+    invocation processes at most BATCH_SIZE groups and finishes well inside
+    the Vercel time limit; long intervals are provided by QStash delays,
+    never by keeping the function alive.
+    """
+    raw_body = await request.body()
+    if QSTASH_VERIFICATION_KEY and not _check_qstash_signature(raw_body, request.headers.get("Signature")):
+        raise HTTPException(status_code=401, detail="Invalid QStash signature")
+
+    try:
+        body = json.loads(raw_body or b"{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(body, dict) or not body.get("task_id"):
+        raise HTTPException(status_code=400, detail="No task_id")
+
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    try:
+        result = await handle_delivery(body, headers=headers, notifier=notify_user)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except MissingEnvError as exc:
+        # Retryable configuration failure: 5xx WITHOUT marking the delivery
+        # processed (handle_delivery only records Message-Id on success), so
+        # QStash retries and the repeat is not silently lost.
+        logger.error("Process blocked: %s", exc)
+        return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=503)
+    except SessionNotAuthorizedError as exc:
+        logger.exception("Process blocked: Telethon session unauthorized")
+        task = get_task(str(body.get("task_id")))
+        if task and task.get("status") in ACTIVE_TASK_STATUSES:
+            task = normalize_task(task)
+            task["status"] = "error"
+            task["last_error"] = str(exc)
+            save_task(task)
+        return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=503)
+    except Exception:
+        logger.exception("Process error for task %s", body.get("task_id"))
+        raise HTTPException(status_code=500, detail="Task processing failed")
+    return JSONResponse(content=result)
 
 
 @app.post("/api/webhook")
@@ -1565,172 +1533,9 @@ async def delete_webhook(x_setup_secret: Optional[str] = Header(None, alias="X-S
 # Telethon connect, no Redis migrations.  Webhook installation is a separate
 # controlled operation (/api/setup-webhook).  This keeps cold starts cheap and
 # immune to Telegram flood control.
-
-
-@app.post("/api/process")
-async def process_task(request: Request):
-    """QStash-triggered task execution with lock-based duplicate protection."""
-    signature = request.headers.get("Signature")
-    if QSTASH_VERIFICATION_KEY and not _check_qstash_signature(request, signature):
-        raise HTTPException(status_code=401, detail="Invalid QStash signature")
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-
-    task_id = body.get("task_id")
-    if not task_id:
-        raise HTTPException(status_code=400, detail="No task_id")
-    expected_repeat = body.get("expected_repeat")
-    if expected_repeat is not None:
-        try:
-            expected_repeat = int(expected_repeat)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="Invalid expected_repeat")
-
-    # Idempotency across repeated deliveries: QStash exposes a stable
-    # Message-Id header for every invocation (retries carry the same id), so
-    # we dedupe on it first.  Additionally we lock per (task, repeat) so even
-    # legacy publishers without a Message-Id cannot send the same repeat twice.
-    message_id = request.headers.get("Message-Id") or request.headers.get("message-id")
-    msg_key = None
-    if message_id:
-        msg_key = f"broadcast:qstash_message:{message_id}"
-        try:
-            seen_before = bool(get_redis().get(msg_key))
-        except Exception:
-            logger.exception("Message-Id dedupe check failed; continuing")
-            seen_before = False
-        if seen_before:
-            logger.info("Duplicate QStash delivery (Message-Id %s) ignored", message_id)
-            return JSONResponse(content={"ok": True, "status": "duplicate_ignored"})
-
-    pre_task = get_task(task_id)
-    if not pre_task:
-        return JSONResponse(content={"ok": False, "error": "Task not found"})
-    repeat_no = int(pre_task.get("completed_repeats", 0))
-    dedupe_key = f"broadcast:processed:{task_id}:{repeat_no}"
-    try:
-        first_delivery = get_redis().set(dedupe_key, "1", nx=True, ex=7 * 24 * 3600)
-    except Exception:
-        logger.exception("Dedupe check failed; continuing with lock only")
-        first_delivery = True
-    if not first_delivery:
-        logger.info("Duplicate QStash delivery for task %s repeat %s ignored", task_id, repeat_no)
-        return JSONResponse(content={"ok": True, "status": "duplicate_ignored"})
-
-    def _mark_message_seen():
-        """Record Message-Id as processed (only after the run is committed)."""
-        if msg_key:
-            try:
-                get_redis().set(msg_key, "1", ex=7 * 24 * 3600)
-            except Exception:
-                logger.exception("Failed to mark Message-Id %s as seen", message_id)
-
-    if not acquire_task_lock(task_id, seconds=120):
-        # The dedupe marker was reserved above, but this delivery did not do
-        # any work.  Remove it so a retry can process the repeat after the
-        # in-flight worker (or an expired stale lock) is gone.
-        try:
-            get_redis().delete(dedupe_key)
-        except Exception:
-            logger.exception("Failed to release dedupe marker for locked task %s", task_id)
-        logger.info("Task %s already processing", task_id)
-        return JSONResponse(content={"ok": True, "status": "already_processing"})
-
-    try:
-        task = get_task(task_id)
-        if not task or task.get("status") not in ACTIVE_TASK_STATUSES:
-            _mark_message_seen()
-            return JSONResponse(content={"ok": True, "status": "inactive_or_missing"})
-
-        current_repeat = int(task.get("completed_repeats", 0))
-        if expected_repeat is not None and expected_repeat != current_repeat:
-            # This is an obsolete delivery from an earlier schedule.  Without
-            # this generation check, a delayed duplicate of repeat N could be
-            # mistaken for repeat N+1 and send the same message again.
-            get_redis().delete(dedupe_key)
-            _mark_message_seen()
-            return JSONResponse(content={"ok": True, "status": "stale_delivery"})
-
-        # Never rely solely on the delivery provider's clock.  A replayed or
-        # prematurely delivered request must not shorten the timer selected by
-        # the user.  Requeue for the exact remaining number of seconds without
-        # consuming a repeat.
-        now = time.time()
-        next_run = float(task.get("next_run") or 0)
-        if next_run > now + 1:
-            schedule_process_in_seconds(task_id, next_run - now, current_repeat)
-            get_redis().delete(dedupe_key)
-            _mark_message_seen()
-            return JSONResponse(content={"ok": True, "status": "not_due_yet"})
-
-        result = await broadcast_message(task.get("groups", []), task.get("message", ""))
-        success_count, failures = result["success"], result["failures"]
-
-        task["completed_repeats"] = int(task.get("completed_repeats", 0)) + 1
-        total_repeats = task.get("total_repeats")
-        if total_repeats is not None and task["completed_repeats"] >= int(total_repeats):
-            task["status"] = "completed"
-        else:
-            interval_minutes = int(task.get("interval_minutes", 1))
-            task["status"] = "active"
-            task["next_run"] = time.time() + interval_minutes * 60
-            try:
-                schedule_process(
-                    task_id,
-                    interval_minutes,
-                    expected_repeat=task["completed_repeats"],
-                )
-            except Exception:
-                logger.exception("Unable to reschedule task %s", task_id)
-                task["status"] = "error"
-        save_task(task)
-        # The run is committed (repeat counter persisted / task completed), so
-        # this Message-Id must never execute again — record it now.  On an
-        # unexpected error below we deliberately do NOT mark it, letting
-        # QStash retry safely via the per-repeat dedupe key rollback.
-        _mark_message_seen()
-
-        # Notify owner about per-send failures (best effort).
-        if failures and BOT_TOKEN:
-            try:
-                bot = create_bot()
-                try:
-                    report = "\n".join(f"• {f['id']}: {f['error']}" for f in failures[:10])
-                    await bot.send_message(task["user_id"], f"⚠️ Часть рассылки не отправлена:\n{report}")
-                finally:
-                    await bot.session.close()
-            except Exception:
-                logger.exception("Failed to notify user %s about send errors", task.get("user_id"))
-
-        return JSONResponse(content={"ok": True, "sent": success_count, "errors": len(failures)})
-    except MissingEnvError as exc:
-        logger.error("Process blocked: %s", exc)
-        # This failure is retryable after configuration is restored.  Do not
-        # leave the repeat reserved, otherwise QStash's retry would be treated
-        # as a duplicate and the timer would silently miss an execution.
-        try:
-            get_redis().delete(dedupe_key)
-        except Exception:
-            logger.exception("Failed to roll back dedupe key for task %s", task_id)
-        return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=503)
-    except SessionNotAuthorizedError as exc:
-        logger.exception("Process blocked: Telethon session unauthorized")
-        task = get_task(task_id)
-        if task and task.get("status") in ACTIVE_TASK_STATUSES:
-            task["status"] = "error"
-            save_task(task)
-        return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=503)
-    except Exception:
-        logger.exception("Process error for task %s", task_id)
-        # The run never committed: roll back the per-repeat dedupe key so a
-        # QStash retry (or a new delivery) can attempt this repeat again.
-        try:
-            get_redis().delete(dedupe_key)
-        except Exception:
-            logger.exception("Failed to roll back dedupe key for task %s", task_id)
-        raise HTTPException(status_code=500, detail="Task processing failed")
-    finally:
-        release_task_lock(task_id)
+#
+# NOTE: the ONLY /api/process implementation is the thin adapter defined
+# above, delegating to services.broadcast_runner.handle_delivery (single
+# source of truth).  The former legacy duplicate endpoint (full-broadcast
+# inside one invocation, task-level dedupe markers written before sending)
+# has been removed after verifying that nothing referenced it.

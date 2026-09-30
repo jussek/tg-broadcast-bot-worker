@@ -269,13 +269,32 @@ def get_due_tasks() -> List[dict]:
     ]
 
 
-def acquire_task_lock(task_id: str, seconds: int = 90) -> bool:
-    result = get_redis().set(_task_lock_key(task_id), "1", nx=True, ex=seconds)
-    return bool(result)
+def acquire_task_lock(task_id: str, seconds: int = 90):
+    """Acquire the per-task lock with an owner token.
+
+    Returns the token string on success (truthy — legacy ``if not acquire...``
+    call sites keep working) or ``None``/falsy when the lock is held.
+    Release with :func:`release_task_lock` passing the same token so a worker
+    never deletes a lock that expired and was re-acquired by someone else.
+    """
+    token = uuid.uuid4().hex
+    result = get_redis().set(_task_lock_key(task_id), token, nx=True, ex=seconds)
+    return token if result else None
 
 
-def release_task_lock(task_id: str):
-    get_redis().delete(_task_lock_key(task_id))
+def release_task_lock(task_id: str, token=None):
+    """Delete the lock only if we still own it (when a token is provided)."""
+    key = _task_lock_key(task_id)
+    if token is None:
+        get_redis().delete(key)
+        return
+    try:
+        current = get_redis().get(key)
+        if current is not None and (current.decode() if isinstance(current, bytes) else str(current)) == token:
+            get_redis().delete(key)
+    except Exception:
+        # Never leave a stale lock behind because of a transient read error.
+        get_redis().delete(key)
 
 
 # ============================================================================

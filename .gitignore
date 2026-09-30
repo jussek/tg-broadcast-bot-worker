@@ -1,9 +1,6 @@
+# Python bytecode
 __pycache__/
 *.pyc
-.env
-.env.*
-!.env.example
+
+# Test cache
 .pytest_cache/
-*.log
-*.tmp
-.vercel/
