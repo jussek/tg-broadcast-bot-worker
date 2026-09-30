@@ -40,12 +40,17 @@ def get_telethon_client_factory() -> TelegramClient:
     """Construct a (not yet connected) TelegramClient for this invocation.
 
     Env vars are re-read on every call so tests and credential rotations take
-    effect without re-importing the module.
+    effect without re-importing the module.  ``API_ID``/``API_HASH``/
+    ``TELEGRAM_SESSION_STRING`` may also be injected as module attributes
+    (used by tests); environment values take precedence when present.
     """
-    api_id = int(_require_env(os.getenv("API_ID"), "API_ID"))
-    api_hash = _require_env(os.getenv("API_HASH"), "API_HASH")
-    session = _require_env(os.getenv("TELEGRAM_SESSION_STRING"), "TELEGRAM_SESSION_STRING")
-    return TelegramClient(StringSession(session), api_id, api_hash)
+    api_id = os.getenv("API_ID") or globals().get("API_ID")
+    api_hash = os.getenv("API_HASH") or globals().get("API_HASH")
+    session = (os.getenv("TELEGRAM_SESSION_STRING")
+               or globals().get("TELEGRAM_SESSION_STRING"))
+    return TelegramClient(StringSession(_require_env(session, "TELEGRAM_SESSION_STRING")),
+                          int(_require_env(api_id, "API_ID")),
+                          _require_env(api_hash, "API_HASH"))
 
 
 async def connect_authorized_client(client: TelegramClient) -> TelegramClient:

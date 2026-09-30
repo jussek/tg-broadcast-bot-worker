@@ -222,7 +222,9 @@ def get_task(task_id: str) -> Optional[dict]:
 
 
 def save_task(task: dict):
-    get_redis().set(_task_key(task["id"]), json.dumps(task, ensure_ascii=False))
+    # TTL keeps finished/cancelled records self-cleaning; active timers are
+    # re-saved on every commit, so their TTL refreshes continuously.
+    get_redis().set(_task_key(task["id"]), json.dumps(task, ensure_ascii=False), ex=90 * 24 * 3600)
 
 
 def delete_task(task_id: str) -> bool:

@@ -224,19 +224,36 @@ def process_endpoint() -> str:
     return f"{app_url()}/api/process"
 
 
+#: QStash provider-level retries for a FAILED invocation (5xx / crash / kill).
+#: Decision (external review item 5): retries=0 left a loss window when the
+#: function was killed BEFORE our own requeue logic could run (Vercel 500,
+#: infra failure, Redis outage at the very start of a delivery).  Because the
+#: engine is fully idempotent (Message-Id dedupe + batch lease + per-send
+#: markers), a provider redelivery is always safe, so we let QStash retry
+#: twice on its own; our backoff-requeues remain the primary recovery path.
+#: The payload is deterministic per (task, repeat, batch), so retries can
+#: never invent a new repeat or double-send an already-confirmed group.
+QSTASH_DELIVERY_RETRIES = int(os.getenv("BROADCAST_QSTASH_RETRIES", "2"))
+
+
+def get_telethon_client():
+    """Default connected-client factory.
+
+    Lazy import keeps services.telegram_delivery out of the module import
+    graph (no circular imports) and lets tests patch this symbol directly.
+    """
+    from services.telegram_delivery import get_telethon_client as _real
+    return _real()
+
+
 def publish_delivery(body: Dict[str, Any], *, delay_seconds: float,
                      dedup_id: Optional[str] = None) -> None:
-    """Publish one /api/process delivery with an absolute delay.
-
-    ``retries=0`` deliberately: our own run-state + markers make redelivery
-    safe, but a provider-level immediate retry storm adds nothing — the timer
-    cadence itself is driven by explicit republishing.
-    """
+    """Publish one /api/process delivery with an absolute delay."""
     get_qstash().message.publish_json(
         url=process_endpoint(),
         body=body,
         delay=normalize_delay(delay_seconds),
-        retries=0,
+        retries=QSTASH_DELIVERY_RETRIES,
         timeout="30s",
         deduplication_id=dedup_id,
     )
@@ -333,14 +350,41 @@ def create_timer_task(user_id: int, message: str, groups: List[str],
 
 
 def create_immediate_run(user_id: int, message: str, groups: List[str]) -> Dict[str, Any]:
-    """"Send now" == a one-shot timer task with due_at = now (same engine)."""
-    task = create_timer_task(user_id=user_id, message=message, groups=groups,
-                             interval_minutes=1, total_repeats=1)
-    # Re-plan the first batch for right now (interval semantics above are for
-    # timers; an immediate run must not wait).
-    schedule_batch(task["id"], 0, 0, 1)
+    """"Send now" == a one-shot task with due_at = now, SAME delivery engine.
+
+    Deliberately does NOT reuse create_timer_task(): that helper publishes a
+    timer delivery (first run one full interval later), and adding a second
+    "now" delivery on top would schedule TWO QStash jobs for one immediate
+    broadcast.  Here exactly ONE initial delivery (repeat_no=0, batch_no=0)
+    is published, delayed by ~1s only to leave room for the UI response.
+    """
+    task_id = str(uuid.uuid4())
+    now = time.time()
+    task = normalize_task({
+        "id": task_id,
+        "user_id": int(user_id),
+        "message": message,
+        "groups": [str(g) for g in dict.fromkeys(groups)],
+        "interval_minutes": 1,
+        "interval_seconds": 60,
+        "total_repeats": 1,
+        "completed_repeats": 0,
+        "status": "active",
+        "created_at": now,
+        "first_run_at": now,
+        "next_run": now,
+    })
+    save_task(task)
+    redis_client.get_redis().sadd(f"broadcast:user:{user_id}:tasks", task_id)
+    try:
+        schedule_batch(task_id, 0, 0, 1)   # EXACTLY ONE initial delivery
+    except Exception:
+        task["status"] = "error"
+        task["last_error"] = "QStash scheduling failed at creation"
+        save_task(task)
+        raise
     logger.info("event=immediate_run_created task_id=%s user_id=%s groups=%s",
-                task["id"], user_id, len(task["groups"]))
+                task_id, user_id, len(task["groups"]))
     return task
 
 
@@ -380,15 +424,40 @@ def create_run(task_id: str, repeat_no: int, scheduled_at: float,
     return run
 
 
-def ensure_run(task: Dict[str, Any], repeat_no: int) -> Dict[str, Any]:
-    """Return the run for this repeat, creating it deterministically.
+def _run_claim_key(task_id: str, repeat_no: int) -> str:
+    return f"broadcast:run_claim:{task_id}:{repeat_no}"
 
-    ``scheduled_at`` for repeat N is derived purely from created_at + N*interval
-    so it is identical no matter which delivery (or replay) creates it.
+
+def ensure_run(task: Dict[str, Any], repeat_no: int) -> Optional[Dict[str, Any]]:
+    """Return the run for this repeat, creating it concurrently-safe.
+
+    ``scheduled_at`` for repeat N is derived purely from first_run_at +
+    N*interval so it is identical no matter which delivery (or replay)
+    creates it.
+
+    Race protection (external review item 3): two parallel deliveries may
+    both observe "no run yet".  A short SET-NX claim makes exactly ONE of
+    them create the run; the loser returns ``None`` and must not proceed
+    with a possibly stale snapshot — its batch lease would then be taken by
+    nobody and QStash retry/our requeue re-enters after the winner saved
+    the run.  The claim TTL is tiny (5s), so even a crashed winner cannot
+    wedge the repeat.
     """
     run = get_run(task["id"], repeat_no)
     if run:
         return run
+    r = redis_client.get_redis()
+    claim_key = _run_claim_key(task["id"], repeat_no)
+    claimed = False
+    try:
+        claimed = bool(r.set(claim_key, "1", nx=True, ex=5))
+    except Exception:
+        logger.exception("Redis unavailable while claiming run %s/%s", task["id"], repeat_no)
+        raise
+    if not claimed:
+        # Someone else is creating this very run right now — do nothing.
+        logger.info("event=run_creation_contended task_id=%s repeat_no=%s", task["id"], repeat_no)
+        return None
     interval = int(task.get("interval_seconds") or task.get("interval_minutes", 1) * 60)
     base = float(task.get("first_run_at") or task.get("created_at", time.time()))
     scheduled_at = base + interval * repeat_no
@@ -696,6 +765,10 @@ async def handle_delivery(body: Dict[str, Any], *, headers: Optional[Dict[str, s
         return {"ok": True, "status": "stale_delivery"}
 
     run = ensure_run(task, repeat_no)
+    if run is None:
+        # Concurrent creation won the race; retry shortly (the run will exist).
+        _requeue_batch(task_id, repeat_no, batch_no, 5)
+        return {"ok": True, "status": "run_contended"}
     if batch_no < 0 or batch_no >= len(run["batches"]):
         return {"ok": True, "status": "stale_delivery"}
     if run.get("status") == "completed":
@@ -719,7 +792,7 @@ async def handle_delivery(body: Dict[str, Any], *, headers: Optional[Dict[str, s
 
     try:
         if client_factory is None:
-            from services.telegram_delivery import get_telethon_client as client_factory  # noqa
+            client_factory = get_telethon_client  # module-level, patchable in tests
 
         if run.get("started_at") is None:
             run["started_at"] = time.time()
