@@ -12,6 +12,27 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "api"))
 
 
+def pytest_collection_modifyitems(items):
+    """Mark the superseded delayed-first timer assertion as expected failure.
+
+    The old regression test explicitly requires the first timer delivery to
+    wait one full interval.  Product behavior intentionally changed: the first
+    cycle is now immediate, with dedicated coverage in
+    ``test_timer_immediate_first.py``.  Keep the old test visible during the
+    transition instead of silently deselecting it.
+    """
+    obsolete = (
+        "tests/test_broadcast_engine.py::"
+        "test_timer_task_schedules_exactly_one_initial_delivery"
+    )
+    for item in items:
+        if item.nodeid.endswith(obsolete):
+            item.add_marker(pytest.mark.xfail(
+                reason="superseded: timer repeat 0 now starts immediately",
+                strict=False,
+            ))
+
+
 class FakeRedis:
     """Minimal in-memory stand-in for the Upstash REST client surface used
     by storage/redis_client and services/broadcast_runner."""
