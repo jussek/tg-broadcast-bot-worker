@@ -1,13 +1,15 @@
 """Vercel entrypoint for the multi-user Telegram broadcast bot.
 
-The mature broadcast implementation stays in api.index. Import it once,
-install the safe per-user Telegram QR-login layer, then re-export its FastAPI
-application.
+Vercel statically discovers a module-level ``app = FastAPI()`` reliably, so
+this wrapper owns the explicit ASGI application and mounts the proven legacy
+application after installing the safe multi-user account layer.
 """
 
 import importlib
 import sys
 from pathlib import Path
+
+from fastapi import FastAPI
 
 _REPO_ROOT = str(Path(__file__).resolve().parents[1])
 if _REPO_ROOT not in sys.path:
@@ -19,4 +21,5 @@ from services.multiuser_qr_extension import install_multiuser  # noqa: E402
 
 install_multiuser(legacy)
 
-app = legacy.app
+app = FastAPI(title="Telegram Broadcast Bot")
+app.mount("/", legacy.app)
