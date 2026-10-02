@@ -16,7 +16,15 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt pytest
       - name: Compile deployment entrypoints
-        run: python -m py_compile api/index.py api/app.py services/multiuser_extension.py services/telegram_login.py storage/telegram_accounts.py
+        run: python -m py_compile api/index.py api/app.py services/multiuser_qr_extension.py storage/telegram_accounts.py services/telegram_delivery.py services/delivery_fixes.py
+      - name: Import multi-user Vercel app
+        env:
+          API_ID: ""
+          API_HASH: ""
+          TELEGRAM_SESSION_STRING: ""
+          BOT_TOKEN: ""
+          WEBHOOK_SETUP_SECRET: "test-webhook-setup-secret-for-encryption"
+        run: python -c "import api.app; assert api.app.app is not None; assert any(getattr(r, 'path', '') == '/health/multiuser' for r in api.app.app.routes)"
       - name: Run test suite
         env:
           API_ID: ""
