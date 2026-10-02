@@ -6,3 +6,4 @@ upstash-redis>=1.0.0
 qstash>=2.0.0
 python-dotenv==1.0.1
 pydantic==2.9.2
+cryptography==50.0.2
