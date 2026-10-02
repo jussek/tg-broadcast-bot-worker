@@ -144,39 +144,6 @@ def test_fetch_user_dialogs_normalizes_groups_channels(monkeypatch):
     ]
 
 
-def test_broadcast_message_isolates_failures(monkeypatch):
-    calls = {"sent": [], "disconnected": False}
-
-    class FakeClient:
-        async def get_entity(self, gid):
-            return gid
-
-        async def send_message(self, entity, text, parse_mode=None):
-            if entity == -2:
-                raise ValueError("boom")
-            calls["sent"].append(entity)
-
-        async def disconnect(self):
-            calls["disconnected"] = True
-
-    async def fake_client():
-        return FakeClient()
-
-    monkeypatch.setattr(index, "get_telethon_client", fake_client)
-    result = asyncio.run(index.broadcast_message(["-1", "-2", "-1", "-3"], "hello"))
-
-    assert result["success"] == 2
-    assert len(result["failures"]) == 1
-    assert calls["sent"] == [-1, -3]
-    assert calls["disconnected"] is True
-
-
-# ------------------------------------------------------------------- QStash
-def test_create_and_schedule_task_persists_and_publishes(fake_redis, monkeypatch):
-    published = []
-    monkeypatch.setattr(index, "schedule_process",
-                        lambda task_id, delay, expected_repeat: published.append(
-                            (task_id, delay, expected_repeat)))
 # ------------------------------------------------------------------- QStash
 def test_create_and_schedule_task_persists_and_publishes(fake_redis, spy_publisher):
     state = {"message_text": "hi", "selected_groups": ["-1001", "-1001"],
@@ -188,7 +155,6 @@ def test_create_and_schedule_task_persists_and_publishes(fake_redis, spy_publish
     assert task["total_repeats"] == 3
     assert task["groups"] == ["-1001"]
     assert task_id in fake_redis.sets["broadcast:user:42:tasks"]
-    assert published == [(task_id, 5, 0)]
     # exactly ONE initial delivery, one full interval later, repeat 0 batch 0
     assert spy_publisher.batches == [(task_id, 0, 0)]
     assert 299 <= spy_publisher.calls[0]["delay_seconds"] <= 301
@@ -243,12 +209,6 @@ def test_early_delivery_waits_until_next_run(fake_redis, monkeypatch, spy_publis
     task = make_task(id="early", first_run_at=now + 75.2, next_run=now + 75.2)
     fake_redis.set("broadcast:task:early", json.dumps(task))
 
-    monkeypatch.setattr(index.time, "time", lambda: now)
-    monkeypatch.setattr(index, "broadcast_message", fake_broadcast)
-    monkeypatch.setattr(index, "schedule_process_in_seconds",
-                        lambda task_id, delay, expected_repeat: delayed.append(
-                            (task_id, delay, expected_repeat)))
-                        lambda task_id, delay: delayed.append((task_id, delay)))
     sent = []
     install_fake_telethon(monkeypatch)
     monkeypatch.setattr(broadcast_runner, "_default_sender", sender_recorder(sent))
@@ -261,8 +221,6 @@ def test_early_delivery_waits_until_next_run(fake_redis, monkeypatch, spy_publis
     result = response.json()
     assert result["status"] == "not_due_yet"
     assert sent == []
-    assert delayed == [("early", pytest.approx(75.2), 0)]
-    assert delayed == [("early", pytest.approx(75.2))]
     # exactly one requeue of the SAME batch
     assert spy_publisher.batches == [("early", 0, 0)]
     delay_seconds = spy_publisher.calls[0]["delay_seconds"]
@@ -275,20 +233,6 @@ def test_early_delivery_waits_until_next_run(fake_redis, monkeypatch, spy_publis
 
 
 def test_stale_delivery_cannot_trigger_the_next_repeat(fake_redis, monkeypatch):
-    """Two provider messages for repeat zero must still produce one send."""
-    from fastapi.testclient import TestClient
-
-    task = {"id": "generation", "user_id": 1, "status": "active", "message": "m",
-            "groups": ["-1001"], "completed_repeats": 1, "total_repeats": 3,
-            "interval_minutes": 5, "next_run": 0}
-    fake_redis.set("broadcast:task:generation", json.dumps(task))
-    sent = []
-
-    async def fake_broadcast(groups, text):
-        sent.append(1)
-        return {"success": 1, "failures": []}
-
-    monkeypatch.setattr(index, "broadcast_message", fake_broadcast)
     """An old repeat-zero replay must be ignored, not invent a new run."""
     from fastapi.testclient import TestClient
 
