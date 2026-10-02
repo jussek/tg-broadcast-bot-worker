@@ -24,7 +24,7 @@ jobs:
           TELEGRAM_SESSION_STRING: ""
           BOT_TOKEN: ""
           WEBHOOK_SETUP_SECRET: "test-webhook-setup-secret-for-encryption"
-        run: python -c "import api.app; assert api.app.app is not None; assert any(getattr(r, 'path', '') == '/health/multiuser' for r in api.app.app.routes)"
+        run: python -c "import api.app; assert api.app.app is not None; assert any(getattr(r, 'path', '') == '/' for r in api.app.app.routes); assert any(getattr(r, 'path', '') == '/health/multiuser' for r in api.app.legacy.app.routes)"
       - name: Run test suite
         env:
           API_ID: ""
