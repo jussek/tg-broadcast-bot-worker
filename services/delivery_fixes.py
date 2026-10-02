@@ -6,12 +6,15 @@ Fixes:
 * A later batch cannot overtake an unfinished previous batch.
 * Slow-mode waits are handled like FloodWait.
 * Every production delivery connects with the Telegram session owned by the
-  task's ``user_id``.  There is no shared-session fallback for another user.
+  task's ``user_id``. There is no shared-session fallback for another user.
+* The runner's existing injectable client hook remains supported for tests and
+  controlled maintenance calls.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from typing import Any, Dict, Optional
 
@@ -68,6 +71,24 @@ def apply_delivery_fixes(br) -> None:
             if marker.get("state") not in ("sent", "failed"):
                 return False
         return True
+
+    def _factory_accepts_user_id(factory) -> bool:
+        """Whether the injectable factory understands a user_id keyword.
+
+        Tests and older maintenance hooks use zero-argument async factories.
+        Production's default hook is services.telegram_delivery.get_telethon_client
+        and accepts user_id. Inspecting the signature avoids catching an
+        unrelated TypeError raised *inside* a factory and accidentally falling
+        back to a shared account.
+        """
+        try:
+            params = inspect.signature(factory).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            p.name == "user_id" or p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in params
+        )
 
     async def handle_delivery(
         body: Dict[str, Any],
@@ -160,10 +181,15 @@ def apply_delivery_fixes(br) -> None:
         try:
             if client_factory is None:
                 owner_id = int(task.get("user_id") or 0)
+                injected_factory = br.get_telethon_client
 
                 async def owner_client_factory():
-                    from services.telegram_delivery import get_telethon_client
-                    return await get_telethon_client(owner_id)
+                    if _factory_accepts_user_id(injected_factory):
+                        return await injected_factory(user_id=owner_id)
+                    # Compatibility only for an explicitly injected zero-arg
+                    # factory (tests/maintenance). The production hook accepts
+                    # user_id and therefore never reaches this branch.
+                    return await injected_factory()
 
                 client_factory = owner_client_factory
 
@@ -176,7 +202,7 @@ def apply_delivery_fixes(br) -> None:
                 summary = await br.execute_batch(
                     task, run, batch_no, client_factory, br._default_sender
                 )
-            except Exception as exc:  # connection/session failures occur before per-chat classification
+            except Exception as exc:
                 if type(exc).__name__ in {
                     "SessionNotAuthorizedError",
                     "TelegramAccountNotConnectedError",
