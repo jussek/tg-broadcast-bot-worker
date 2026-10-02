@@ -2,23 +2,21 @@
 
 Single source of truth for scheduling/executing broadcasts:
   * services/broadcast_runner.py  — QStash planning, runs, batches, idempotency
-  * services/telegram_delivery.py — Telethon client lifecycle
+  * services/telegram_delivery.py — per-user Telethon client lifecycle
   * services/delivery_fixes.py    — production hardening for entity resolution
                                     and within-repeat batch sequencing
   * services/timer_behavior.py    — timer starts immediately, then uses interval
-
-The previous duplicates (services/scheduler_service.py,
-services/telegram_service.py, bot/dispatcher.py) were dead legacy code with a
-second, unsafe scheduler implementation and have been removed after verifying
-that no production or test code referenced them.
 """
 from . import broadcast_runner
+from . import telegram_delivery
 from .delivery_fixes import apply_delivery_fixes
 from .timer_behavior import apply_timer_behavior
 
-# Apply production hardening before callers import symbols directly from
-# services.broadcast_runner.  The patches are idempotent and keep the module's
-# public API stable for existing handlers/tests.
+# Make the runner's injectable client hook user-aware before installing the
+# delivery wrapper. Tests may still monkeypatch this hook with a zero-argument
+# factory; delivery_fixes preserves that dependency-injection contract.
+broadcast_runner.get_telethon_client = telegram_delivery.get_telethon_client
+
 apply_delivery_fixes(broadcast_runner)
 apply_timer_behavior(broadcast_runner)
 
