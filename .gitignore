@@ -1,9 +1,16 @@
+# Python
 __pycache__/
 *.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Local secrets / credentials
 .env
 .env.*
 !.env.example
-.pytest_cache/
-*.log
-*.tmp
+*.session
+*.session-journal
+
+# Local tooling
 .vercel/

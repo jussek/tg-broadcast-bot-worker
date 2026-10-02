@@ -33,7 +33,7 @@ SET_STATE_FIELDS = {"selected", "template_group_ids", "legacy_template_chat_ids"
 class Task:
     """Scheduled broadcast task."""
     def __init__(self, id: str, user_id: int, message: str, groups: List[int],
-                 interval_minutes: int, total_repeats: int, status: str = "active",
+                 interval_minutes: int, total_repeats: Optional[int], status: str = "active",
                  completed_repeats: int = 0, created_at: float = None, next_run: float = None):
         self.id = id
         self.user_id = user_id
@@ -193,7 +193,8 @@ def _decode_state(state: dict) -> dict:
 # Task Operations
 # ============================================================================
 
-def create_task(user_id: int, message: str, groups: list, interval_minutes: int, repeats: int) -> dict:
+def create_task(user_id: int, message: str, groups: list, interval_minutes: int,
+                repeats: Optional[int]) -> dict:
     task_id = str(uuid.uuid4())
     now = time.time()
     task = {
@@ -202,7 +203,7 @@ def create_task(user_id: int, message: str, groups: list, interval_minutes: int,
         "message": message,
         "groups": [int(x) for x in groups],
         "interval_minutes": int(interval_minutes),
-        "total_repeats": int(repeats),
+        "total_repeats": None if repeats is None else int(repeats),
         "completed_repeats": 0,
         "status": "active",
         "created_at": now,
@@ -221,7 +222,9 @@ def get_task(task_id: str) -> Optional[dict]:
 
 
 def save_task(task: dict):
-    get_redis().set(_task_key(task["id"]), json.dumps(task, ensure_ascii=False))
+    # TTL keeps finished/cancelled records self-cleaning; active timers are
+    # re-saved on every commit, so their TTL refreshes continuously.
+    get_redis().set(_task_key(task["id"]), json.dumps(task, ensure_ascii=False), ex=90 * 24 * 3600)
 
 
 def delete_task(task_id: str) -> bool:
@@ -268,13 +271,32 @@ def get_due_tasks() -> List[dict]:
     ]
 
 
-def acquire_task_lock(task_id: str, seconds: int = 90) -> bool:
-    result = get_redis().set(_task_lock_key(task_id), "1", nx=True, ex=seconds)
-    return bool(result)
+def acquire_task_lock(task_id: str, seconds: int = 90):
+    """Acquire the per-task lock with an owner token.
+
+    Returns the token string on success (truthy — legacy ``if not acquire...``
+    call sites keep working) or ``None``/falsy when the lock is held.
+    Release with :func:`release_task_lock` passing the same token so a worker
+    never deletes a lock that expired and was re-acquired by someone else.
+    """
+    token = uuid.uuid4().hex
+    result = get_redis().set(_task_lock_key(task_id), token, nx=True, ex=seconds)
+    return token if result else None
 
 
-def release_task_lock(task_id: str):
-    get_redis().delete(_task_lock_key(task_id))
+def release_task_lock(task_id: str, token=None):
+    """Delete the lock only if we still own it (when a token is provided)."""
+    key = _task_lock_key(task_id)
+    if token is None:
+        get_redis().delete(key)
+        return
+    try:
+        current = get_redis().get(key)
+        if current is not None and (current.decode() if isinstance(current, bytes) else str(current)) == token:
+            get_redis().delete(key)
+    except Exception:
+        # Never leave a stale lock behind because of a transient read error.
+        get_redis().delete(key)
 
 
 # ============================================================================
