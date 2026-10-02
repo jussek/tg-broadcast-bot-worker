@@ -1,7 +1,8 @@
 """Vercel entrypoint for the multi-user Telegram broadcast bot.
 
-The mature broadcast implementation stays in api.index.  Import it once,
-install the multi-user account layer, then re-export its FastAPI application.
+The mature broadcast implementation stays in api.index. Import it once,
+install the safe per-user Telegram QR-login layer, then re-export its FastAPI
+application.
 """
 
 import importlib
@@ -14,7 +15,7 @@ if _REPO_ROOT not in sys.path:
 
 legacy = importlib.import_module("api.index")
 
-from services.multiuser_extension import install_multiuser  # noqa: E402
+from services.multiuser_qr_extension import install_multiuser  # noqa: E402
 
 install_multiuser(legacy)
 
