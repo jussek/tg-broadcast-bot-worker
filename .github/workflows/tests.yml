@@ -15,13 +15,13 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt pytest
-      - run: pip install -r requirements.txt
-      - name: Compile deployment entrypoint
-        run: python -m py_compile api/index.py
+      - name: Compile deployment entrypoints
+        run: python -m py_compile api/index.py api/app.py services/multiuser_extension.py services/telegram_login.py storage/telegram_accounts.py
       - name: Run test suite
         env:
           API_ID: ""
           API_HASH: ""
           TELEGRAM_SESSION_STRING: ""
           BOT_TOKEN: ""
+          WEBHOOK_SETUP_SECRET: "test-webhook-setup-secret-for-encryption"
         run: pytest -q
