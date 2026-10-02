@@ -1,7 +1,7 @@
 fastapi==0.115.0
 uvicorn==0.30.6
 aiogram==3.13.1
-telethon==1.36.0
+telethon==1.45.0
 upstash-redis>=1.0.0
 qstash>=2.0.0
 python-dotenv==1.0.1
