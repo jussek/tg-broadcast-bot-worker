@@ -1,23 +1,32 @@
 """Telethon user-session delivery primitives (lifecycle + dialogs).
 
-Single place where the Telethon client is built, connected, authorized and
-disconnected.  Telethon 1.36 is pinned in requirements.txt — it does NOT
-accept ``timeout=`` on ``connect()`` nor ``request_timeout=`` on the client
-constructor, so all time bounds here use ``asyncio.wait_for`` instead.
+Each bot user owns a separate encrypted Telegram StringSession.  The worker
+loads only the session that belongs to the task owner, so one user's broadcast
+can never silently fall back to another user's Telegram account.
+
+A legacy environment StringSession is still supported when callers omit
+``user_id`` (tests/local maintenance only). Production broadcast paths always
+pass the task owner's bot user id.
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List
+from typing import Dict, List, Optional
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
+from storage.telegram_accounts import (
+    SessionEncryptionError,
+    TelegramAccountNotConnectedError,
+    get_session_string,
+)
+
 logger = logging.getLogger("broadcast.telegram")
 
-# Per-operation wall-clock bounds (seconds). Generous enough for cold TLS
-# handshakes, small enough to never approach the Vercel function limit.
 TELETHON_CONNECT_TIMEOUT = float(os.getenv("TELETHON_CONNECT_TIMEOUT", "20"))
 TELETHON_FETCH_TIMEOUT = float(os.getenv("TELETHON_FETCH_TIMEOUT", "25"))
 
@@ -27,7 +36,7 @@ class MissingEnvError(RuntimeError):
 
 
 class SessionNotAuthorizedError(RuntimeError):
-    """Telethon session exists but is not authorized for a user account."""
+    """Telethon session is missing, unreadable or not authorized."""
 
 
 def _require_env(value, name: str) -> str:
@@ -36,39 +45,43 @@ def _require_env(value, name: str) -> str:
     return value
 
 
-def get_telethon_client_factory() -> TelegramClient:
-    """Construct a (not yet connected) TelegramClient for this invocation.
+def _session_for_user(user_id: Optional[int]) -> str:
+    if user_id is None:
+        # Compatibility path for local tooling/tests. Production worker code
+        # passes a user_id and therefore never uses this shared credential.
+        return _require_env(
+            os.getenv("TELEGRAM_SESSION_STRING") or globals().get("TELEGRAM_SESSION_STRING"),
+            "TELEGRAM_SESSION_STRING",
+        )
+    try:
+        return get_session_string(int(user_id))
+    except (TelegramAccountNotConnectedError, SessionEncryptionError) as exc:
+        raise SessionNotAuthorizedError(str(exc)) from exc
 
-    Env vars are re-read on every call so tests and credential rotations take
-    effect without re-importing the module.  ``API_ID``/``API_HASH``/
-    ``TELEGRAM_SESSION_STRING`` may also be injected as module attributes
-    (used by tests); environment values take precedence when present.
-    """
+
+def get_telethon_client_factory(user_id: Optional[int] = None) -> TelegramClient:
+    """Construct a Telethon client for exactly one bot user's account."""
     api_id = os.getenv("API_ID") or globals().get("API_ID")
     api_hash = os.getenv("API_HASH") or globals().get("API_HASH")
-    session = (os.getenv("TELEGRAM_SESSION_STRING")
-               or globals().get("TELEGRAM_SESSION_STRING"))
-    return TelegramClient(StringSession(_require_env(session, "TELEGRAM_SESSION_STRING")),
-                          int(_require_env(api_id, "API_ID")),
-                          _require_env(api_hash, "API_HASH"))
+    session = _session_for_user(user_id)
+    return TelegramClient(
+        StringSession(session),
+        int(_require_env(api_id, "API_ID")),
+        _require_env(api_hash, "API_HASH"),
+    )
 
 
 async def connect_authorized_client(client: TelegramClient) -> TelegramClient:
-    """Connect a client and verify it belongs to an authorized account.
-
-    The connect itself is bounded by asyncio.wait_for (Telethon's connect has
-    no timeout kwarg).  On ANY failure the client is disconnected in a
-    finally-style cleanup so no half-open socket leaks into the next serverless
-    event loop usage.
-    """
+    """Connect a client and verify it belongs to an authorized account."""
     try:
         await asyncio.wait_for(client.connect(), timeout=TELETHON_CONNECT_TIMEOUT)
-        authorized = await asyncio.wait_for(client.is_user_authorized(),
-                                           timeout=TELETHON_CONNECT_TIMEOUT)
+        authorized = await asyncio.wait_for(
+            client.is_user_authorized(), timeout=TELETHON_CONNECT_TIMEOUT
+        )
         if not authorized:
             raise SessionNotAuthorizedError(
-                "Telegram user session is not authorized. "
-                "Пересоздайте TELEGRAM_SESSION_STRING на авторизованном устройстве."
+                "Telegram-сессия больше не авторизована. Переподключите аккаунт "
+                "в разделе «👤 Telegram-аккаунт»."
             )
     except Exception:
         try:
@@ -79,23 +92,49 @@ async def connect_authorized_client(client: TelegramClient) -> TelegramClient:
     return client
 
 
-async def get_telethon_client() -> TelegramClient:
-    """Create a connected, authorized Telethon client for this invocation."""
-    return await connect_authorized_client(get_telethon_client_factory())
+async def get_telethon_client(user_id: Optional[int] = None) -> TelegramClient:
+    """Create a connected, authorized client for ``user_id``.
+
+    Calling the factory without an argument when ``user_id`` is omitted keeps
+    the original dependency-injection contract used by maintenance code and
+    tests. Production worker calls always provide a concrete owner id.
+    """
+    if user_id is None:
+        client = get_telethon_client_factory()
+    else:
+        client = get_telethon_client_factory(user_id)
+    return await connect_authorized_client(client)
+
+
+def _obviously_writable_dialog(dialog) -> bool:
+    """Exclude read-only broadcast channels where posting is impossible.
+
+    Megagroups and normal groups remain visible; Telegram can still impose
+    per-user restrictions there, which are handled during the actual send.
+    """
+    entity = getattr(dialog, "entity", None)
+    if dialog.is_channel and getattr(entity, "broadcast", False):
+        return bool(
+            getattr(entity, "creator", False)
+            or getattr(entity, "admin_rights", None)
+        )
+    return bool(dialog.is_group or dialog.is_channel)
 
 
 async def fetch_user_dialogs(client) -> List[Dict[str, str]]:
-    """Iterate ALL dialogs (no artificial limit); normalize groups/channels."""
+    """Iterate all usable groups/channels for this authorized account."""
     dialogs: List[Dict[str, str]] = []
     async for dialog in client.iter_dialogs():
-        if dialog.is_group or dialog.is_channel:
-            dialogs.append({
-                "id": str(dialog.id),
-                "title": dialog.title or dialog.name or str(dialog.id),
-            })
+        if not _obviously_writable_dialog(dialog):
+            continue
+        dialogs.append({
+            "id": str(dialog.id),
+            "title": dialog.title or dialog.name or str(dialog.id),
+        })
     return dialogs
 
 
 async def fetch_dialogs_with_timeout(client) -> List[Dict[str, str]]:
-    """Dialog fetch bounded by a wall-clock timeout for webhook safety."""
-    return await asyncio.wait_for(fetch_user_dialogs(client), timeout=TELETHON_FETCH_TIMEOUT)
+    return await asyncio.wait_for(
+        fetch_user_dialogs(client), timeout=TELETHON_FETCH_TIMEOUT
+    )
