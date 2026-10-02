@@ -106,7 +106,10 @@ def test_worker_opens_task_owners_personal_account(fake_redis, spy_publisher, mo
         seen_users.append(user_id)
         return FakeClient()
 
-    monkeypatch.setattr("services.telegram_delivery.get_telethon_client", personal_client)
+    # delivery_fixes intentionally resolves through the runner hook so tests
+    # and controlled maintenance code can inject a factory without weakening
+    # the production user-id ownership boundary.
+    monkeypatch.setattr(br, "get_telethon_client", personal_client)
 
     task = br.create_immediate_run(4242, "HELLO", ["-100123"])
     result = asyncio.run(
