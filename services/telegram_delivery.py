@@ -93,8 +93,17 @@ async def connect_authorized_client(client: TelegramClient) -> TelegramClient:
 
 
 async def get_telethon_client(user_id: Optional[int] = None) -> TelegramClient:
-    """Create a connected, authorized client for ``user_id``."""
-    return await connect_authorized_client(get_telethon_client_factory(user_id))
+    """Create a connected, authorized client for ``user_id``.
+
+    Calling the factory without an argument when ``user_id`` is omitted keeps
+    the original dependency-injection contract used by maintenance code and
+    tests. Production worker calls always provide a concrete owner id.
+    """
+    if user_id is None:
+        client = get_telethon_client_factory()
+    else:
+        client = get_telethon_client_factory(user_id)
+    return await connect_authorized_client(client)
 
 
 def _obviously_writable_dialog(dialog) -> bool:
