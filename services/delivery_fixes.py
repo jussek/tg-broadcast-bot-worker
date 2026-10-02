@@ -1,20 +1,12 @@
 """Production hardening for Telethon delivery and batch sequencing.
 
-This module is intentionally small and applied from ``services.__init__`` so
-existing imports keep working while the fixes remain isolated and regression
--testable.
-
 Fixes:
-* Resolve an InputPeer before sending.  ``StringSession`` carries Telegram
-  authorization but a fresh serverless process may not have the channel
-  access_hash/entity cache.  On a cache miss we encounter the account dialogs
-  once, then resolve again and send to the resolved InputPeer.
-* All batches of one repeat share the same scheduled_at.  The repeat interval
-  separates repeats, not batches.  Later batches are chained by QStash with a
-  short delay and are never delayed by another full repeat interval.
+* Resolve InputPeer/access_hash reliably in fresh serverless processes.
+* All batches of one repeat share the same scheduled_at.
 * A later batch cannot overtake an unfinished previous batch.
-* Slow-mode waits are handled like FloodWait and rescheduled instead of being
-  burned through the generic retry counter.
+* Slow-mode waits are handled like FloodWait.
+* Every production delivery connects with the Telegram session owned by the
+  task's ``user_id``.  There is no shared-session fallback for another user.
 """
 
 from __future__ import annotations
@@ -41,13 +33,6 @@ def apply_delivery_fixes(br) -> None:
         return legacy_classify_exception(exc)
 
     async def resilient_default_sender(client, group_id: str, text: str) -> None:
-        """Resolve the peer reliably in stateless/serverless Telethon clients.
-
-        A StringSession is sufficient to authorize the account, but a new
-        process can start without the entity/access_hash cache required for
-        channels and supergroups.  We only enumerate dialogs after an actual
-        cache miss, so the common path remains fast.
-        """
         gid = int(group_id)
         target = gid
         get_input_entity = getattr(client, "get_input_entity", None)
@@ -61,8 +46,6 @@ def apply_delivery_fixes(br) -> None:
                 get_dialogs = getattr(client, "get_dialogs", None)
                 if get_dialogs is None:
                     raise
-                # Encounter dialogs once to hydrate Telethon's in-memory entity
-                # cache (id + account-bound access_hash), then resolve again.
                 await asyncio.wait_for(
                     get_dialogs(limit=None), timeout=max(br.TELETHON_OP_TIMEOUT, 25.0)
                 )
@@ -93,7 +76,6 @@ def apply_delivery_fixes(br) -> None:
         client_factory=None,
         notifier=None,
     ) -> Dict[str, Any]:
-        """Process one QStash batch with corrected within-repeat sequencing."""
         headers = headers or {}
         delivery_terminal = False
         task_id = br._as_str(body.get("task_id") or "")
@@ -158,10 +140,6 @@ def apply_delivery_fixes(br) -> None:
             return {"ok": True, "status": "already_completed"}
 
         interval = int(task.get("interval_seconds") or task.get("interval_minutes", 1) * 60)
-
-        # The repeat interval applies to REPEATS only.  Every batch in this
-        # repeat becomes eligible at the repeat's scheduled_at and subsequent
-        # batches are chained with the explicit 1-second QStash delay below.
         due = float(run.get("scheduled_at") or 0)
         now = time.time()
         if due > now + 1:
@@ -169,9 +147,6 @@ def apply_delivery_fixes(br) -> None:
             delivery_terminal = True
             return {"ok": True, "status": "not_due_yet"}
 
-        # Protect ordering against a forged/out-of-order QStash delivery.  The
-        # normal path publishes batch N only after N-1 reached terminal marker
-        # states, but this guard keeps retries/replays safe too.
         if not _previous_batch_finished(run, batch_no):
             br._requeue_batch(task_id, repeat_no, batch_no, 5)
             delivery_terminal = True
@@ -184,14 +159,45 @@ def apply_delivery_fixes(br) -> None:
 
         try:
             if client_factory is None:
-                client_factory = br.get_telethon_client
+                owner_id = int(task.get("user_id") or 0)
+
+                async def owner_client_factory():
+                    from services.telegram_delivery import get_telethon_client
+                    return await get_telethon_client(owner_id)
+
+                client_factory = owner_client_factory
 
             if run.get("started_at") is None:
                 run["started_at"] = time.time()
                 run["status"] = "processing"
                 br.save_run(run)
 
-            summary = await br.execute_batch(task, run, batch_no, client_factory, br._default_sender)
+            try:
+                summary = await br.execute_batch(
+                    task, run, batch_no, client_factory, br._default_sender
+                )
+            except Exception as exc:  # connection/session failures occur before per-chat classification
+                if type(exc).__name__ in {
+                    "SessionNotAuthorizedError",
+                    "TelegramAccountNotConnectedError",
+                    "SessionEncryptionError",
+                }:
+                    task["status"] = "error"
+                    task["last_error"] = "Telegram account is not connected or authorization expired"
+                    task["next_run"] = None
+                    br.save_task(task)
+                    delivery_terminal = True
+                    br.logger.warning(
+                        "event=telegram_account_unavailable task_id=%s user_id=%s",
+                        task_id,
+                        task.get("user_id"),
+                    )
+                    return {
+                        "ok": False,
+                        "status": "telegram_account_unavailable",
+                        "task_status": "error",
+                    }
+                raise
 
             if summary.get("flood_wait") is not None:
                 wait = min(int(summary["flood_wait"]) + 2, 24 * 3600)
