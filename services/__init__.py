@@ -5,6 +5,7 @@ Single source of truth for scheduling/executing broadcasts:
   * services/telegram_delivery.py — Telethon client lifecycle
   * services/delivery_fixes.py    — production hardening for entity resolution
                                     and within-repeat batch sequencing
+  * services/timer_behavior.py    — timer starts immediately, then uses interval
 
 The previous duplicates (services/scheduler_service.py,
 services/telegram_service.py, bot/dispatcher.py) were dead legacy code with a
@@ -13,11 +14,13 @@ that no production or test code referenced them.
 """
 from . import broadcast_runner
 from .delivery_fixes import apply_delivery_fixes
+from .timer_behavior import apply_timer_behavior
 
 # Apply production hardening before callers import symbols directly from
-# services.broadcast_runner.  The patch is idempotent and keeps the module's
+# services.broadcast_runner.  The patches are idempotent and keep the module's
 # public API stable for existing handlers/tests.
 apply_delivery_fixes(broadcast_runner)
+apply_timer_behavior(broadcast_runner)
 
 MissingEnvError = broadcast_runner.MissingEnvError
 SessionNotAuthorizedError = broadcast_runner.SessionNotAuthorizedError
