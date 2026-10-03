@@ -1,8 +1,7 @@
 """Telethon user-session delivery primitives (lifecycle + dialogs).
 
 Each bot owner may have multiple encrypted Telegram StringSessions. Production
-broadcast tasks can pin an exact Telegram account id so switching the active
-account later does not change the sender of an already-created task.
+broadcast tasks can optionally pin an exact Telegram account id.
 """
 
 from __future__ import annotations
@@ -48,6 +47,8 @@ def _session_for_user(user_id: Optional[int], account_id: Optional[int] = None) 
             "TELEGRAM_SESSION_STRING",
         )
     try:
+        if account_id is None:
+            return get_session_string(int(user_id))
         return get_session_string(int(user_id), account_id=account_id)
     except (TelegramAccountNotConnectedError, SessionEncryptionError) as exc:
         raise SessionNotAuthorizedError(str(exc)) from exc
@@ -70,9 +71,7 @@ def get_telethon_client_factory(
 async def connect_authorized_client(client: TelegramClient) -> TelegramClient:
     try:
         await asyncio.wait_for(client.connect(), timeout=TELETHON_CONNECT_TIMEOUT)
-        authorized = await asyncio.wait_for(
-            client.is_user_authorized(), timeout=TELETHON_CONNECT_TIMEOUT
-        )
+        authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=TELETHON_CONNECT_TIMEOUT)
         if not authorized:
             raise SessionNotAuthorizedError(
                 "Telegram-сессия больше не авторизована. Переподключите аккаунт "
