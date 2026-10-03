@@ -1,12 +1,8 @@
 """Telethon user-session delivery primitives (lifecycle + dialogs).
 
-Each bot user owns a separate encrypted Telegram StringSession.  The worker
-loads only the session that belongs to the task owner, so one user's broadcast
-can never silently fall back to another user's Telegram account.
-
-A legacy environment StringSession is still supported when callers omit
-``user_id`` (tests/local maintenance only). Production broadcast paths always
-pass the task owner's bot user id.
+Each bot owner may have multiple encrypted Telegram StringSessions. Production
+broadcast tasks can pin an exact Telegram account id so switching the active
+account later does not change the sender of an already-created task.
 """
 
 from __future__ import annotations
@@ -32,11 +28,11 @@ TELETHON_FETCH_TIMEOUT = float(os.getenv("TELETHON_FETCH_TIMEOUT", "25"))
 
 
 class MissingEnvError(RuntimeError):
-    """A required environment variable is not configured."""
+    pass
 
 
 class SessionNotAuthorizedError(RuntimeError):
-    """Telethon session is missing, unreadable or not authorized."""
+    pass
 
 
 def _require_env(value, name: str) -> str:
@@ -45,25 +41,25 @@ def _require_env(value, name: str) -> str:
     return value
 
 
-def _session_for_user(user_id: Optional[int]) -> str:
+def _session_for_user(user_id: Optional[int], account_id: Optional[int] = None) -> str:
     if user_id is None:
-        # Compatibility path for local tooling/tests. Production worker code
-        # passes a user_id and therefore never uses this shared credential.
         return _require_env(
             os.getenv("TELEGRAM_SESSION_STRING") or globals().get("TELEGRAM_SESSION_STRING"),
             "TELEGRAM_SESSION_STRING",
         )
     try:
-        return get_session_string(int(user_id))
+        return get_session_string(int(user_id), account_id=account_id)
     except (TelegramAccountNotConnectedError, SessionEncryptionError) as exc:
         raise SessionNotAuthorizedError(str(exc)) from exc
 
 
-def get_telethon_client_factory(user_id: Optional[int] = None) -> TelegramClient:
-    """Construct a Telethon client for exactly one bot user's account."""
+def get_telethon_client_factory(
+    user_id: Optional[int] = None,
+    account_id: Optional[int] = None,
+) -> TelegramClient:
     api_id = os.getenv("API_ID") or globals().get("API_ID")
     api_hash = os.getenv("API_HASH") or globals().get("API_HASH")
-    session = _session_for_user(user_id)
+    session = _session_for_user(user_id, account_id=account_id)
     return TelegramClient(
         StringSession(session),
         int(_require_env(api_id, "API_ID")),
@@ -72,7 +68,6 @@ def get_telethon_client_factory(user_id: Optional[int] = None) -> TelegramClient
 
 
 async def connect_authorized_client(client: TelegramClient) -> TelegramClient:
-    """Connect a client and verify it belongs to an authorized account."""
     try:
         await asyncio.wait_for(client.connect(), timeout=TELETHON_CONNECT_TIMEOUT)
         authorized = await asyncio.wait_for(
@@ -92,37 +87,25 @@ async def connect_authorized_client(client: TelegramClient) -> TelegramClient:
     return client
 
 
-async def get_telethon_client(user_id: Optional[int] = None) -> TelegramClient:
-    """Create a connected, authorized client for ``user_id``.
-
-    Calling the factory without an argument when ``user_id`` is omitted keeps
-    the original dependency-injection contract used by maintenance code and
-    tests. Production worker calls always provide a concrete owner id.
-    """
+async def get_telethon_client(
+    user_id: Optional[int] = None,
+    account_id: Optional[int] = None,
+) -> TelegramClient:
     if user_id is None:
         client = get_telethon_client_factory()
     else:
-        client = get_telethon_client_factory(user_id)
+        client = get_telethon_client_factory(user_id, account_id=account_id)
     return await connect_authorized_client(client)
 
 
 def _obviously_writable_dialog(dialog) -> bool:
-    """Exclude read-only broadcast channels where posting is impossible.
-
-    Megagroups and normal groups remain visible; Telegram can still impose
-    per-user restrictions there, which are handled during the actual send.
-    """
     entity = getattr(dialog, "entity", None)
     if dialog.is_channel and getattr(entity, "broadcast", False):
-        return bool(
-            getattr(entity, "creator", False)
-            or getattr(entity, "admin_rights", None)
-        )
+        return bool(getattr(entity, "creator", False) or getattr(entity, "admin_rights", None))
     return bool(dialog.is_group or dialog.is_channel)
 
 
 async def fetch_user_dialogs(client) -> List[Dict[str, str]]:
-    """Iterate all usable groups/channels for this authorized account."""
     dialogs: List[Dict[str, str]] = []
     async for dialog in client.iter_dialogs():
         if not _obviously_writable_dialog(dialog):
@@ -135,6 +118,4 @@ async def fetch_user_dialogs(client) -> List[Dict[str, str]]:
 
 
 async def fetch_dialogs_with_timeout(client) -> List[Dict[str, str]]:
-    return await asyncio.wait_for(
-        fetch_user_dialogs(client), timeout=TELETHON_FETCH_TIMEOUT
-    )
+    return await asyncio.wait_for(fetch_user_dialogs(client), timeout=TELETHON_FETCH_TIMEOUT)
