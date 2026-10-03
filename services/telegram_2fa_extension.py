@@ -1,5 +1,9 @@
 """Add Telegram cloud-password (2FA) support to the phone-code login flow.
 
+This extension deliberately replaces the legacy POST /connect/{token}/verify-code
+route instead of adding a parallel login route. That guarantees that both fresh
+and already-open connect pages hit the same 2FA-aware handler.
+
 The 2FA password is accepted only by a same-origin HTTPS POST and is used
 immediately with Telethon. It is never written to Redis, task state, logs, or
 the encrypted connect challenge. Only the temporary StringSession and a small
@@ -10,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import html
-from types import SimpleNamespace
 from typing import Any, Dict
 
 from fastapi import Request
@@ -35,20 +38,49 @@ MAX_2FA_ATTEMPTS = 5
 MAX_PASSWORD_LENGTH = 512
 
 
+def _remove_post_route(app, path: str) -> int:
+    """Remove matching POST routes and return how many were removed."""
+    before = len(app.router.routes)
+    app.router.routes[:] = [
+        route
+        for route in app.router.routes
+        if not (
+            getattr(route, "path", None) == path
+            and "POST" in (getattr(route, "methods", None) or set())
+        )
+    ]
+    return before - len(app.router.routes)
+
+
 def install_twofa(legacy) -> None:
-    """Install 2FA routes and upgrade the connect-page UI."""
+    """Replace the legacy code verifier with a single native 2FA-aware flow."""
     if getattr(legacy, "_TELEGRAM_2FA_INSTALLED", False):
         return
     legacy._TELEGRAM_2FA_INSTALLED = True
 
+    # The base multi-user extension already registered /verify-code. Remove it
+    # before registering the 2FA-aware handler at the exact same URL. This is
+    # critical: an old page that is already open in the browser may still POST
+    # to /verify-code, and it must never reach the obsolete 409 handler.
+    removed = _remove_post_route(legacy.app, "/connect/{token}/verify-code")
+    if removed != 1:
+        login_layer.logger.warning(
+            "Expected one legacy Telegram verify-code route, removed %s", removed
+        )
+
+    # Clean up route names from the previous parallel implementation if this
+    # module is ever loaded in a warm/reloaded process.
+    _remove_post_route(legacy.app, "/connect/{token}/verify-login")
+    _remove_post_route(legacy.app, "/connect/{token}/verify-password")
+
     # connect_page() in the base extension resolves this module global at
-    # request time, so replacing it upgrades the existing route without
-    # registering a duplicate GET /connect/{token} endpoint.
+    # request time, so replacing it upgrades the existing GET route without
+    # registering another GET /connect/{token} endpoint.
     original_page_renderer = login_layer._connect_page_html
     login_layer._connect_page_html = _build_page_renderer(original_page_renderer)
 
-    @legacy.app.post("/connect/{token}/verify-login")
-    async def verify_login(token: str, request: Request):
+    @legacy.app.post("/connect/{token}/verify-code")
+    async def verify_code(token: str, request: Request):
         challenge = login_layer._load_valid_challenge(token)
         if not challenge or challenge.get("stage") != "code":
             return JSONResponse(
@@ -82,7 +114,7 @@ def install_twofa(legacy) -> None:
                 challenge["stage"] = "password"
                 challenge["temp_session"] = client.session.save()
                 challenge["password_attempts"] = 0
-                # Important: the one-time code and 2FA password are not saved.
+                # Important: neither the one-time code nor the 2FA password is saved.
                 save_connect_challenge(token, challenge)
                 return JSONResponse({"ok": True, "requires_2fa": True, "stage": "password"})
 
@@ -227,7 +259,7 @@ def _code_or_password_page(token: str, challenge: Dict[str, Any]) -> str:
   <label>Облачный пароль Telegram</label>
   <input id='password' type='password' autocomplete='current-password' maxlength='{MAX_PASSWORD_LENGTH}' placeholder='Введите пароль'>
   <button onclick='verifyPassword()'>Подключить аккаунт</button>
-  <p class='note'>Пароль передаётся только Telegram через текущий HTTPS-запрос и не сохраняется. Осталось попыток: {remaining}.</p>
+  <p class='note'>Пароль используется только для текущего входа и не сохраняется. Осталось попыток: {remaining}.</p>
 </div>
 """
     else:
@@ -270,7 +302,7 @@ function finish(j) {{
 }}
 async function verifyCode() {{
   try {{
-    const j=await post('verify-login', {{code:document.getElementById('code').value}});
+    const j=await post('verify-code', {{code:document.getElementById('code').value}});
     if(j.requires_2fa) {{ location.reload(); return; }}
     finish(j);
   }} catch(e) {{ showError(e.message); }}
