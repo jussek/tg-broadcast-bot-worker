@@ -13,10 +13,12 @@ if _REPO_ROOT not in sys.path:
 legacy = importlib.import_module("api.index")
 
 from services.multiuser_qr_extension import install_multiuser  # noqa: E402
+from services.telegram_2fa_extension import install_twofa  # noqa: E402
 from services.account_selector_extension import install_account_selector  # noqa: E402
 from services.task_account_pinning import install_task_account_pinning  # noqa: E402
 
 install_multiuser(legacy)
+install_twofa(legacy)
 install_account_selector(legacy)
 install_task_account_pinning(legacy)
 
