@@ -1,9 +1,4 @@
-"""Vercel entrypoint for the multi-user Telegram broadcast bot.
-
-Vercel statically discovers a module-level ``app = FastAPI()`` reliably, so
-this wrapper owns the explicit ASGI application and mounts the proven legacy
-application after installing the safe multi-user account layer.
-"""
+"""Vercel entrypoint for the multi-user Telegram broadcast bot."""
 
 import importlib
 import sys
@@ -18,8 +13,10 @@ if _REPO_ROOT not in sys.path:
 legacy = importlib.import_module("api.index")
 
 from services.multiuser_qr_extension import install_multiuser  # noqa: E402
+from services.account_selector_extension import install_account_selector  # noqa: E402
 
 install_multiuser(legacy)
+install_account_selector(legacy)
 
 app = FastAPI(title="Telegram Broadcast Bot")
 app.mount("/", legacy.app)
